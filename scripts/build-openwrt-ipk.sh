@@ -18,9 +18,8 @@ cp -a "$payload/." "$work/data/"
 chmod 0755 "$work/data/usr/libexec/glinet-crossmodel-backup"
 chmod 0755 "$work/data/usr/libexec/glinet-crossmodel-remote"
 
-# Do not register admin/services as an alias. An alias intercepts nested
-# /api/* routes on LuCI 21.02, which breaks profile listing and creation.
-# Add a regular firstchild parent in the main controller instead.
+# GL.iNet's LuCI uses string modes for nixio.fs.chmod(). Also create a real
+# Services parent; never use an alias because it intercepts nested API routes.
 controller="$work/data/usr/lib/lua/luci/controller/glinet_crossmodel.lua"
 python3 - "$controller" <<'PY'
 from pathlib import Path
@@ -37,9 +36,21 @@ if new not in text:
     if old not in text:
         raise SystemExit("LuCI controller index() function was not found")
     text = text.replace(old, new, 1)
-path.write_text(text, encoding="utf-8")
 
-# Remove menu files left by older package builds.
+modes = {
+    'fs.chmod(PROFILE_DIR, 448)': 'fs.chmod(PROFILE_DIR, "0700")',
+    'fs.chmod(TMP_DIR, 448)': 'fs.chmod(TMP_DIR, "0700")',
+    'fs.chmod(path, 384)': 'fs.chmod(path, "0600")',
+    'fs.chmod(output, 384)': 'fs.chmod(output, "0600")',
+    'fs.chmod(temporary, 384)': 'fs.chmod(temporary, "0600")',
+}
+for source, replacement in modes.items():
+    text = text.replace(source, replacement)
+
+if ', 448)' in text or ', 384)' in text:
+    raise SystemExit("numeric nixio.fs.chmod mode remains in controller")
+
+path.write_text(text, encoding="utf-8")
 for name in ("glinet_crossmodel_menu.lua",):
     stale = path.parent / name
     if stale.exists():
@@ -81,7 +92,7 @@ rm -f "$ipk" "$ipk.sha256"
 (cd "$work" && tar --owner=0 --group=0 --numeric-owner -czf "$ipk" ./debian-binary ./data.tar.gz ./control.tar.gz)
 sha256sum "$ipk" > "$ipk.sha256"
 
-# Validate package layout and, critically, the non-alias menu registration.
+# Validate package layout and generated LuCI fixes.
 tar -tzf "$ipk" | grep -qx './debian-binary'
 tar -tzf "$ipk" | grep -qx './data.tar.gz'
 tar -tzf "$ipk" | grep -qx './control.tar.gz'
@@ -89,6 +100,10 @@ tar -xOzf "$ipk" ./debian-binary | grep -qx '2.0'
 tar -xOzf "$ipk" ./data.tar.gz > "$work/data-check.tar.gz"
 tar -tzf "$work/data-check.tar.gz" | grep -qx './usr/lib/lua/luci/controller/glinet_crossmodel.lua'
 ! tar -tzf "$work/data-check.tar.gz" | grep -q 'glinet_crossmodel_menu.lua'
-tar -xOzf "$work/data-check.tar.gz" ./usr/lib/lua/luci/controller/glinet_crossmodel.lua | grep -Fqx $'\tlocal services = entry({"admin", "services"}, firstchild(), _("Services"), 60)'
+tar -xOzf "$work/data-check.tar.gz" ./usr/lib/lua/luci/controller/glinet_crossmodel.lua > "$work/controller-check.lua"
+grep -Fqx $'\tlocal services = entry({"admin", "services"}, firstchild(), _("Services"), 60)' "$work/controller-check.lua"
+grep -Fqx 'fs.chmod(PROFILE_DIR, "0700")' "$work/controller-check.lua"
+grep -Fqx 'fs.chmod(TMP_DIR, "0700")' "$work/controller-check.lua"
+! grep -Eq ', (448|384)\)' "$work/controller-check.lua"
 
 echo "Built $ipk"
