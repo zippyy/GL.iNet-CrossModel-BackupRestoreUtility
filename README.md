@@ -2,11 +2,11 @@
 
 This `OpenWRT` branch packages the utility as a native LuCI application that can be compiled into an IPK for GL.iNet/OpenWrt routers. It does **not** require Docker, Node.js, or a separately hosted web service.
 
-Install the generated IPK on the source router to create a portable profile archive, then install the same IPK on the target router to upload and restore compatible settings locally.
+Install the generated IPK on one control router, such as a Flint 3 or Flint 4. From its LuCI page, you can create profiles from that router itself or from reachable GL.iNet/OpenWrt routers on the LAN over SSH. The same control router can also push a profile to a selected LAN router and execute the native restore there. Remote routers do **not** need this IPK installed.
 
 ## Build the IPK
 
-Use an OpenWrt SDK that matches the target router's firmware release, target/subtarget, ABI, and package architecture.
+Use an OpenWrt SDK that matches the control router's firmware release, target/subtarget, ABI, and package architecture.
 
 ```sh
 git clone --branch OpenWRT https://github.com/zippyy/GL.iNet-CrossModel-BackupRestoreUtility.git
@@ -22,7 +22,7 @@ make package/luci-app-glinet-crossmodel-backup/compile V=s
 
 The generated IPK appears under `bin/packages/<architecture>/...` inside the SDK.
 
-## Install on a GL.iNet router
+## Install on the control router
 
 ```sh
 opkg install /tmp/luci-app-glinet-crossmodel-backup_*.ipk
@@ -30,6 +30,17 @@ opkg install /tmp/luci-app-glinet-crossmodel-backup_*.ipk
 ```
 
 Open LuCI and go to **Services → GL.iNet Cross-Model Backup**.
+
+The IPK depends on `openssh-client` and `sshpass` so it can manage LAN routers by password-authenticated SSH. Credentials are submitted only for the active request, placed in a temporary mode-0600 file, and deleted after the SSH task. New host keys are accepted once and saved in the control router's `/root/.ssh/known_hosts`; a later key mismatch is rejected rather than silently trusted.
+
+## Remote LAN workflow
+
+1. Install the IPK on the control router only.
+2. On **Backup source**, enable **Connect to another LAN router over SSH**, enter its LAN address, SSH port, username, and password, then test the connection.
+3. Create the portable profile. It is copied back and saved on the control router.
+4. On **Restore target**, enable **Restore to another LAN router over SSH**, enter that router's SSH details, upload a profile, choose categories, and restore.
+
+During each remote operation, the control router streams the native backend script to the remote router over SSH. It creates or applies the profile locally on that remote router, then removes the temporary remote archive and helper inputs when the job finishes.
 
 ## Native portable profile contents
 
