@@ -14,20 +14,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build IPK
+
+      - name: Build legacy-compatible IPK
         run: |
           chmod +x scripts/build-openwrt-ipk.sh
           scripts/build-openwrt-ipk.sh
-      - name: Verify IPK container
+
+      - name: Verify exact legacy opkg archive layout
         run: |
-          set -e
+          set -euo pipefail
           ipk=$(find dist -name '*.ipk' -type f | head -n1)
           test -n "$ipk"
           test "$(ar t "$ipk" | tr '\n' ' ')" = 'debian-binary control.tar.gz data.tar.gz '
           test "$(ar p "$ipk" debian-binary)" = '2.0'
-          ar p "$ipk" control.tar.gz | tar -xOzf - ./control | grep -qx 'Package: luci-app-glinet-crossmodel-backup'
-          ar p "$ipk" data.tar.gz | tar -tzf - | grep -q '^./usr/libexec/glinet-crossmodel-backup$'
-          ar p "$ipk" data.tar.gz | tar -tzf - | grep -q '^./usr/libexec/glinet-crossmodel-remote$'
+          ar p "$ipk" control.tar.gz | tar -tzf - | grep -qx 'control'
+          ar p "$ipk" control.tar.gz | tar -tzf - | grep -qx 'postinst'
+          ar p "$ipk" control.tar.gz | tar -xOzf - control | grep -qx 'Package: luci-app-glinet-crossmodel-backup'
+          ar p "$ipk" data.tar.gz | tar -tzf - | grep -qx 'usr/libexec/glinet-crossmodel-backup'
+          ar p "$ipk" data.tar.gz | tar -tzf - | grep -qx 'usr/libexec/glinet-crossmodel-remote'
+          test -z "$(ar p "$ipk" control.tar.gz | tar -tzf - | grep '^\./' || true)"
+          test -z "$(ar p "$ipk" data.tar.gz | tar -tzf - | grep '^\./' || true)"
+
       - uses: actions/upload-artifact@v4
         with:
           name: glinet-crossmodel-backup-ipk
