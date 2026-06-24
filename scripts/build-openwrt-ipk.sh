@@ -18,9 +18,33 @@ cp -a "$payload/." "$work/data/"
 chmod 0755 "$work/data/usr/libexec/glinet-crossmodel-backup"
 chmod 0755 "$work/data/usr/libexec/glinet-crossmodel-remote"
 
-# GL.iNet 4.0 can have no visible Services parent menu. Make it an alias to this app.
-mkdir -p "$work/data/usr/lib/lua/luci/controller"
-printf '%s' 'bW9kdWxlKCJsdWNpLmNvbnRyb2xsZXIuZ2xpbmV0X2Nyb3NzbW9kZWxfbWVudSIsIHBhY2thZ2Uuc2VlYWxsKQoKZnVuY3Rpb24gaW5kZXgoKQoJbG9jYWwgc2VydmljZXMgPSBlbnRyeSh7ImFkbWluIiwgInNlcnZpY2VzIn0sIGFsaWFzKCJhZG1pbiIsICJzZXJ2aWNlcyIsICJnbGluZXQtY3Jvc3Ntb2RlbCIpLCBfKCJTZXJ2aWNlcyIpLCA2MCkKCXNlcnZpY2VzLmRlcGVuZGVudCA9IGZhbHNlCmVuZAo=' | base64 -d > "$work/data/usr/lib/lua/luci/controller/glinet_crossmodel_menu.lua"
+# Do not register admin/services as an alias. An alias intercepts nested
+# /api/* routes on LuCI 21.02, which breaks profile listing and creation.
+# Add a regular firstchild parent in the main controller instead.
+controller="$work/data/usr/lib/lua/luci/controller/glinet_crossmodel.lua"
+python3 - "$controller" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+old = 'function index()\n'
+new = '''function index()
+\tlocal services = entry({"admin", "services"}, firstchild(), _("Services"), 60)
+\tservices.dependent = false
+'''
+if new not in text:
+    if old not in text:
+        raise SystemExit("LuCI controller index() function was not found")
+    text = text.replace(old, new, 1)
+path.write_text(text, encoding="utf-8")
+
+# Remove menu files left by older package builds.
+for name in ("glinet_crossmodel_menu.lua",):
+    stale = path.parent / name
+    if stale.exists():
+        stale.unlink()
+PY
 
 size="$(du -sk "$work/data" | awk '{print $1}')"
 cat > "$work/control/control" <<EOF
@@ -40,8 +64,8 @@ cat > "$work/control/postinst" <<'EOF'
 [ -n "$IPKG_INSTROOT" ] && exit 0
 mkdir -p /root/glinet-crossmodel/profiles /tmp/glinet-crossmodel /root/.ssh
 chmod 700 /root/.ssh
-# Do not restart nginx or uhttpd here. Package Manager installs over an XHR
-# request, so restarting its web server aborts the browser request.
+# Do not restart nginx or uhttpd here. LuCI Package Manager runs this through
+# an XHR request, and a restart aborts the browser response.
 rm -f /tmp/luci-indexcache
 rm -rf /tmp/luci-modulecache
 exit 0
@@ -49,7 +73,7 @@ EOF
 chmod 0755 "$work/control/postinst"
 printf '2.0\n' > "$work/debian-binary"
 
-# GL.iNet firmware 4.0 / OpenWrt 21.02 expects a gzip-compressed tar wrapper.
+# GL.iNet firmware 4.0 / OpenWrt 21.02 opkg expects this gzip tar wrapper.
 (cd "$work/data" && tar --owner=0 --group=0 --numeric-owner -czf "$work/data.tar.gz" .)
 (cd "$work/control" && tar --owner=0 --group=0 --numeric-owner -czf "$work/control.tar.gz" .)
 ipk="$out/${name}_${version}-${release}_all.ipk"
@@ -57,12 +81,14 @@ rm -f "$ipk" "$ipk.sha256"
 (cd "$work" && tar --owner=0 --group=0 --numeric-owner -czf "$ipk" ./debian-binary ./data.tar.gz ./control.tar.gz)
 sha256sum "$ipk" > "$ipk.sha256"
 
-# Validate the exact GL.iNet tar-format package before publishing it.
+# Validate package layout and, critically, the non-alias menu registration.
 tar -tzf "$ipk" | grep -qx './debian-binary'
 tar -tzf "$ipk" | grep -qx './data.tar.gz'
 tar -tzf "$ipk" | grep -qx './control.tar.gz'
 tar -xOzf "$ipk" ./debian-binary | grep -qx '2.0'
 tar -xOzf "$ipk" ./data.tar.gz > "$work/data-check.tar.gz"
-tar -tzf "$work/data-check.tar.gz" | grep -qx './usr/lib/lua/luci/controller/glinet_crossmodel_menu.lua'
+tar -tzf "$work/data-check.tar.gz" | grep -qx './usr/lib/lua/luci/controller/glinet_crossmodel.lua'
+! tar -tzf "$work/data-check.tar.gz" | grep -q 'glinet_crossmodel_menu.lua'
+tar -xOzf "$work/data-check.tar.gz" ./usr/lib/lua/luci/controller/glinet_crossmodel.lua | grep -Fqx $'\tlocal services = entry({"admin", "services"}, firstchild(), _("Services"), 60)'
 
 echo "Built $ipk"
