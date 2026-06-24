@@ -1,0 +1,201 @@
+#!/bin/sh
+# SSH coordinator for luci-app-glinet-crossmodel-backup.
+# Runs on the router hosting the IPK. It streams the native backend to a
+# remote GL.iNet/OpenWrt router, so the remote device does not need this IPK.
+
+set -eu
+PATH='/usr/sbin:/usr/bin:/sbin:/bin'
+APP='/usr/libexec/glinet-crossmodel-backup'
+KNOWN_HOSTS='/root/.ssh/known_hosts'
+
+log() { printf '%s\n' "$*"; }
+die() { log "ERROR: $*" >&2; exit 1; }
+usage() {
+	cat >&2 <<'EOF'
+Usage:
+  glinet-crossmodel-remote facts <host> <port> <user> <password-file>
+  glinet-crossmodel-remote create <local-output.tar.gz> <profile-id> <categories-csv> <scripts-list> <binaries-list> <host> <port> <user> <password-file>
+  glinet-crossmodel-remote restore <local-input.tar.gz> <profile-id> <categories-csv> <install-packages:0|1> <direct-files:0|1> <host> <port> <user> <password-file>
+EOF
+	exit 2
+}
+
+valid_host() {
+	case "$1" in
+		''|*[!A-Za-z0-9._:-]*) return 1 ;;
+		*) return 0 ;;
+	esac
+}
+
+valid_port() {
+	case "$1" in
+		''|*[!0-9]*) return 1 ;;
+	esac
+	[ "$1" -ge 1 ] 2>/dev/null && [ "$1" -le 65535 ] 2>/dev/null
+}
+
+valid_user() {
+	case "$1" in
+		''|*[!A-Za-z0-9._-]*) return 1 ;;
+		*) return 0 ;;
+	esac
+}
+
+valid_id() {
+	case "$1" in
+		*[!a-f0-9-]*|'') return 1 ;;
+		*) return 0 ;;
+	esac
+}
+
+valid_categories() {
+	local original part canonical
+	original="$1"
+	canonical=''
+	[ -n "$original" ] || return 1
+	while [ -n "$original" ]; do
+		part="${original%%,*}"
+		if [ "$original" = "$part" ]; then original=''; else original="${original#*,}"; fi
+		case "$part" in
+			network|wireless|vpn|firewall|adguard|ddns|system|packages|scripts|binaries) ;;
+			*) return 1 ;;
+		esac
+		case ",$canonical," in *",$part,"*) ;; *) canonical="${canonical:+$canonical,}$part" ;; esac
+	done
+	printf '%s\n' "$canonical"
+}
+
+remote_target() {
+	local host user
+	host="$1"
+	user="$2"
+	case "$host" in
+		*:) die 'Invalid remote host.' ;;
+		*:* ) printf '%s@[%s]\n' "$user" "$host" ;;
+		* ) printf '%s@%s\n' "$user" "$host" ;;
+	esac
+}
+
+prepare_connection() {
+	local host port user passfile
+	host="$1"; port="$2"; user="$3"; passfile="$4"
+	valid_host "$host" || die 'Remote host contains invalid characters.'
+	valid_port "$port" || die 'Remote SSH port must be 1 through 65535.'
+	valid_user "$user" || die 'Remote SSH username contains invalid characters.'
+	[ -f "$passfile" ] || die 'Temporary SSH credential file is missing.'
+	[ -x "$APP" ] || die 'Native backup backend is missing.'
+	command -v ssh >/dev/null 2>&1 || die 'OpenSSH client is not installed.'
+	command -v scp >/dev/null 2>&1 || die 'OpenSSH scp client is not installed.'
+	command -v sshpass >/dev/null 2>&1 || die 'sshpass is not installed.'
+	mkdir -p /root/.ssh
+	chmod 700 /root/.ssh
+}
+
+ssh_run() {
+	# host port user passfile command...
+	local host port user passfile target
+	host="$1"; port="$2"; user="$3"; passfile="$4"; shift 4
+	target="$(remote_target "$host" "$user")"
+	sshpass -f "$passfile" ssh \
+		-o BatchMode=no \
+		-o ConnectTimeout=12 \
+		-o ServerAliveInterval=5 \
+		-o ServerAliveCountMax=2 \
+		-o StrictHostKeyChecking=accept-new \
+		-o UserKnownHostsFile="$KNOWN_HOSTS" \
+		-p "$port" "$target" "$@"
+}
+
+scp_to() {
+	# local host port user passfile remote-path
+	local local_file host port user passfile remote_path target
+	local_file="$1"; host="$2"; port="$3"; user="$4"; passfile="$5"; remote_path="$6"
+	target="$(remote_target "$host" "$user")"
+	sshpass -f "$passfile" scp \
+		-o ConnectTimeout=12 \
+		-o ServerAliveInterval=5 \
+		-o ServerAliveCountMax=2 \
+		-o StrictHostKeyChecking=accept-new \
+		-o UserKnownHostsFile="$KNOWN_HOSTS" \
+		-P "$port" "$local_file" "$target:$remote_path"
+}
+
+scp_from() {
+	# host port user passfile remote-path local
+	local host port user passfile remote_path local_file target
+	host="$1"; port="$2"; user="$3"; passfile="$4"; remote_path="$5"; local_file="$6"
+	target="$(remote_target "$host" "$user")"
+	sshpass -f "$passfile" scp \
+		-o ConnectTimeout=12 \
+		-o ServerAliveInterval=5 \
+		-o ServerAliveCountMax=2 \
+		-o StrictHostKeyChecking=accept-new \
+		-o UserKnownHostsFile="$KNOWN_HOSTS" \
+		-P "$port" "$target:$remote_path" "$local_file"
+}
+
+stream_backend() {
+	# host port user passfile action arguments...
+	local host port user passfile
+	host="$1"; port="$2"; user="$3"; passfile="$4"; shift 4
+	cat "$APP" | ssh_run "$host" "$port" "$user" "$passfile" sh -s -- "$@"
+}
+
+facts() {
+	[ "$#" -eq 4 ] || usage
+	prepare_connection "$1" "$2" "$3" "$4"
+	stream_backend "$1" "$2" "$3" "$4" facts
+}
+
+remote_create() {
+	[ "$#" -eq 9 ] || usage
+	local output id categories scripts binaries host port user passfile remote_base remote_archive remote_scripts remote_binaries work
+	output="$1"; id="$2"; categories="$(valid_categories "$3")" || die 'Invalid backup categories.'; scripts="$4"; binaries="$5"; host="$6"; port="$7"; user="$8"; passfile="$9"
+	valid_id "$id" || die 'Invalid profile ID.'
+	[ -f "$scripts" ] || die 'Custom scripts list is missing.'
+	[ -f "$binaries" ] || die 'Custom binaries list is missing.'
+	prepare_connection "$host" "$port" "$user" "$passfile"
+	work="$(mktemp -d /tmp/glinet-crossmodel-remote.XXXXXX)"
+	remote_base="/tmp/glinet-crossmodel-${id}"
+	remote_archive="${remote_base}.tar.gz"
+	remote_scripts="${remote_base}-scripts.list"
+	remote_binaries="${remote_base}-binaries.list"
+	trap 'rm -rf "$work"; ssh_run "$host" "$port" "$user" "$passfile" rm -f "$remote_archive" "$remote_scripts" "$remote_binaries" >/dev/null 2>&1 || true' EXIT INT TERM
+	cp "$scripts" "$work/scripts.list"
+	cp "$binaries" "$work/binaries.list"
+	scp_to "$work/scripts.list" "$host" "$port" "$user" "$passfile" "$remote_scripts"
+	scp_to "$work/binaries.list" "$host" "$port" "$user" "$passfile" "$remote_binaries"
+	stream_backend "$host" "$port" "$user" "$passfile" create "$remote_archive" "$id" "$categories" "$remote_scripts" "$remote_binaries"
+	scp_from "$host" "$port" "$user" "$passfile" "$remote_archive" "$output"
+	[ -s "$output" ] || die 'Remote router created an empty profile archive.'
+	ssh_run "$host" "$port" "$user" "$passfile" rm -f "$remote_archive" "$remote_scripts" "$remote_binaries"
+	trap - EXIT INT TERM
+	rm -rf "$work"
+	log "CREATED=$output"
+	log "REMOTE_SOURCE=$host"
+}
+
+remote_restore() {
+	[ "$#" -eq 9 ] || usage
+	local input id categories install_packages direct_files host port user passfile remote_archive
+	input="$1"; id="$2"; categories="$(valid_categories "$3")" || die 'Invalid restore categories.'; install_packages="$4"; direct_files="$5"; host="$6"; port="$7"; user="$8"; passfile="$9"
+	valid_id "$id" || die 'Invalid profile ID.'
+	[ -f "$input" ] || die 'Portable profile archive is missing.'
+	case "$install_packages" in 0|1) ;; *) die 'Invalid package install option.' ;; esac
+	case "$direct_files" in 0|1) ;; *) die 'Invalid direct file restore option.' ;; esac
+	prepare_connection "$host" "$port" "$user" "$passfile"
+	remote_archive="/tmp/glinet-crossmodel-restore-${id}.tar.gz"
+	trap 'ssh_run "$host" "$port" "$user" "$passfile" rm -f "$remote_archive" >/dev/null 2>&1 || true' EXIT INT TERM
+	scp_to "$input" "$host" "$port" "$user" "$passfile" "$remote_archive"
+	stream_backend "$host" "$port" "$user" "$passfile" restore "$remote_archive" "$categories" "$install_packages" "$direct_files"
+	ssh_run "$host" "$port" "$user" "$passfile" rm -f "$remote_archive"
+	trap - EXIT INT TERM
+	log "REMOTE_TARGET=$host"
+}
+
+case "${1:-}" in
+	facts) shift; facts "$@" ;;
+	create) shift; remote_create "$@" ;;
+	restore) shift; remote_restore "$@" ;;
+	*) usage ;;
+esac
