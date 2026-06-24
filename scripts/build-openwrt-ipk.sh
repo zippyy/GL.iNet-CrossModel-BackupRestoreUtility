@@ -10,13 +10,23 @@ OUTPUT_DIR="${OUTPUT_DIR:-$ROOT_DIR/dist}"
 package_name="$(sed -n 's/^PKG_NAME:=//p' "$MAKEFILE" | head -n1)"
 version="$(sed -n 's/^PKG_VERSION:=//p' "$MAKEFILE" | head -n1)"
 release="$(sed -n 's/^PKG_RELEASE:=//p' "$MAKEFILE" | head -n1)"
-depends="$(sed -n 's/^  DEPENDS:=//p' "$MAKEFILE" | head -n1 | tr -d '+')"
+depends_raw="$(sed -n 's/^  DEPENDS:=//p' "$MAKEFILE" | head -n1)"
 title="$(sed -n 's/^  TITLE:=//p' "$MAKEFILE" | head -n1)"
 
 [[ -n "$package_name" ]] || { echo 'PKG_NAME not found in OpenWrt package Makefile' >&2; exit 1; }
 [[ -n "$version" ]] || { echo 'PKG_VERSION not found in OpenWrt package Makefile' >&2; exit 1; }
 [[ -n "$release" ]] || { echo 'PKG_RELEASE not found in OpenWrt package Makefile' >&2; exit 1; }
 [[ -d "$FILES_DIR" ]] || { echo 'OpenWrt package root payload is missing' >&2; exit 1; }
+
+# OpenWrt Makefiles use +pkg-name dependency syntax. The IPK control file
+# requires a comma-separated Depends field; whitespace-separated names create
+# a malformed control stanza that opkg refuses to parse.
+depends_words="${depends_raw//+/}"
+read -r -a dependency_list <<< "$depends_words"
+depends=""
+if ((${#dependency_list[@]})); then
+  depends="$(IFS=,; printf '%s' "${dependency_list[*]}")"
+fi
 
 work_dir="$(mktemp -d)"
 trap 'rm -rf "$work_dir"' EXIT
@@ -63,18 +73,34 @@ chmod 0755 "$control_dir/postinst"
 printf '2.0\n' > "$work_dir/debian-binary"
 (
   cd "$control_dir"
-  tar --owner=0 --group=0 --numeric-owner -czf "$work_dir/control.tar.gz" .
+  tar --format=gnu --owner=0 --group=0 --numeric-owner -czf "$work_dir/control.tar.gz" .
 )
 (
   cd "$data_dir"
-  tar --owner=0 --group=0 --numeric-owner -czf "$work_dir/data.tar.gz" .
+  tar --format=gnu --owner=0 --group=0 --numeric-owner -czf "$work_dir/data.tar.gz" .
 )
 
 ipk="$OUTPUT_DIR/${package_name}_${version}-${release}_all.ipk"
 rm -f "$ipk"
 (
   cd "$work_dir"
-  ar r "$ipk" debian-binary control.tar.gz data.tar.gz
+  ar rcs "$ipk" debian-binary control.tar.gz data.tar.gz
 )
 
+# Fail the build unless the result has the exact IPK container and a valid
+# OpenWrt control file. This catches malformed packages before release upload.
+mapfile -t ar_members < <(ar t "$ipk")
+[[ "${ar_members[*]}" == "debian-binary control.tar.gz data.tar.gz" ]] || {
+  printf 'Invalid IPK ar members: %s\n' "${ar_members[*]}" >&2
+  exit 1
+}
+[[ "$(ar p "$ipk" debian-binary)" == "2.0" ]] || { echo 'Invalid debian-binary member' >&2; exit 1; }
+ar p "$ipk" control.tar.gz | tar -xOzf - ./control > "$work_dir/control-check"
+grep -qx "Package: $package_name" "$work_dir/control-check"
+grep -qx "Architecture: all" "$work_dir/control-check"
+grep -qx "Depends: $depends" "$work_dir/control-check"
+ar p "$ipk" data.tar.gz | tar -tzf - >/dev/null
+
+sha256sum "$ipk" > "${ipk}.sha256"
 echo "Built $ipk"
+echo "Depends: $depends"
