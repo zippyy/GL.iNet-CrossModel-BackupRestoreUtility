@@ -2,141 +2,86 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-PAYLOAD_DIR="$ROOT_DIR/openwrt/luci-app-glinet-crossmodel-backup/root"
-MAKEFILE="$ROOT_DIR/openwrt/luci-app-glinet-crossmodel-backup/Makefile"
+PACKAGE_DIR="$ROOT_DIR/openwrt/luci-app-glinet-crossmodel-backup"
+PAYLOAD_DIR="$PACKAGE_DIR/root"
+MAKEFILE="$PACKAGE_DIR/Makefile"
 OUTPUT_DIR="$ROOT_DIR/dist"
+PACKAGE_NAME="luci-app-glinet-crossmodel-backup"
 
-export PAYLOAD_DIR MAKEFILE OUTPUT_DIR
+version="$(sed -n 's/^PKG_VERSION:=//p' "$MAKEFILE" | head -n1)"
+release="$(sed -n 's/^PKG_RELEASE:=//p' "$MAKEFILE" | head -n1)"
 
-python3 - <<'PY'
-from __future__ import annotations
+[ -n "$version" ] || { echo 'PKG_VERSION is missing' >&2; exit 1; }
+[ -n "$release" ] || { echo 'PKG_RELEASE is missing' >&2; exit 1; }
+[ -d "$PAYLOAD_DIR" ] || { echo "Missing payload directory: $PAYLOAD_DIR" >&2; exit 1; }
 
-import gzip
-import io
-import os
-import re
-import stat
-import tarfile
-from pathlib import Path
+work_dir="$(mktemp -d)"
+trap 'rm -rf "$work_dir"' EXIT
+control_dir="$work_dir/control"
+data_dir="$work_dir/data"
+mkdir -p "$control_dir" "$data_dir" "$OUTPUT_DIR"
 
-payload = Path(os.environ['PAYLOAD_DIR'])
-makefile = Path(os.environ['MAKEFILE'])
-outdir = Path(os.environ['OUTPUT_DIR'])
+cp -a "$PAYLOAD_DIR/." "$data_dir/"
+chmod 0755 "$data_dir/usr/libexec/glinet-crossmodel-backup"
+chmod 0755 "$data_dir/usr/libexec/glinet-crossmodel-remote"
 
-if not payload.is_dir():
-    raise SystemExit(f'Missing payload directory: {payload}')
-
-text = makefile.read_text(encoding='utf-8')
-def value(name: str) -> str:
-    match = re.search(rf'^{re.escape(name)}:=(.+)$', text, re.MULTILINE)
-    if not match:
-        raise SystemExit(f'Missing {name} in {makefile}')
-    return match.group(1).strip()
-
-name = value('PKG_NAME')
-version = value('PKG_VERSION')
-release = value('PKG_RELEASE')
-outdir.mkdir(parents=True, exist_ok=True)
-ipk = outdir / f'{name}_{version}-{release}_all.ipk'
-
-control = f'''Package: {name}
-Version: {version}-{release}
-Architecture: all
-Installed-Size: 0
-Section: utils
+installed_size="$(du -sk "$data_dir" | awk '{print $1}')"
+cat > "$control_dir/control" <<EOF
+Package: $PACKAGE_NAME
+Version: $version-$release
+Section: luci
 Priority: optional
 Maintainer: zippyy
+Architecture: all
+Installed-Size: $installed_size
 Description: GL.iNet Cross-Model Backup and Restore
  Native LuCI utility for portable GL.iNet and OpenWrt configuration profiles.
-'''.encode('utf-8')
-postinst = b'''#!/bin/sh
+EOF
+
+cat > "$control_dir/postinst" <<'EOF'
+#!/bin/sh
 [ -n "$IPKG_INSTROOT" ] && exit 0
 mkdir -p /root/glinet-crossmodel/profiles /tmp/glinet-crossmodel /root/.ssh
 chmod 700 /root/.ssh
-rm -f /tmp/luci-indexcache /tmp/luci-modulecache/* 2>/dev/null || true
-[ -x /etc/init.d/nginx ] && /etc/init.d/nginx restart >/dev/null 2>&1 || true
+rm -f /tmp/luci-indexcache
+rm -rf /tmp/luci-modulecache
 [ -x /etc/init.d/uhttpd ] && /etc/init.d/uhttpd restart >/dev/null 2>&1 || true
+[ -x /etc/init.d/nginx ] && /etc/init.d/nginx restart >/dev/null 2>&1 || true
 exit 0
-'''
+EOF
+chmod 0755 "$control_dir/postinst"
+printf '2.0\n' > "$work_dir/debian-binary"
 
-def tar_gz(entries: list[tuple[str, bytes, int]]) -> bytes:
-    output = io.BytesIO()
-    with tarfile.open(fileobj=output, mode='w:gz', format=tarfile.GNU_FORMAT) as archive:
-        for name, content, mode in entries:
-            info = tarfile.TarInfo(name=name)
-            info.size = len(content)
-            info.mode = mode
-            info.uid = info.gid = 0
-            info.uname = info.gname = ''
-            info.mtime = 0
-            archive.addfile(info, io.BytesIO(content))
-    return output.getvalue()
+# GL.iNet firmware 4.0 / OpenWrt 21.02 opkg expects a gzip-compressed tar
+# wrapper, not a Debian ar archive. Keep this order: debian-binary, data, control.
+(
+  cd "$data_dir"
+  tar --owner=0 --group=0 --numeric-owner -czf "$work_dir/data.tar.gz" .
+)
+(
+  cd "$control_dir"
+  tar --owner=0 --group=0 --numeric-owner -czf "$work_dir/control.tar.gz" .
+)
 
-# Critical for GL.iNet's legacy opkg: tar members must be named `control` and
-# `usr/...`, not `./control` / `./usr/...`.
-control_tar = tar_gz([
-    ('control', control, 0o644),
-    ('postinst', postinst, 0o755),
-])
+ipk="$OUTPUT_DIR/${PACKAGE_NAME}_${version}-${release}_all.ipk"
+rm -f "$ipk" "$ipk.sha256"
+(
+  cd "$work_dir"
+  tar --owner=0 --group=0 --numeric-owner -czf "$ipk" \
+    ./debian-binary ./data.tar.gz ./control.tar.gz
+)
+sha256sum "$ipk" > "$ipk.sha256"
 
-data_entries: list[tuple[str, bytes, int]] = []
-for path in sorted(payload.rglob('*')):
-    if not path.is_file():
-        continue
-    rel = path.relative_to(payload).as_posix()
-    mode = stat.S_IMODE(path.stat().st_mode)
-    data_entries.append((rel, path.read_bytes(), mode))
-if not data_entries:
-    raise SystemExit('Package payload is empty')
-data_tar = tar_gz(data_entries)
+# Refuse to publish the old ar format or a malformed control archive.
+tar -tzf "$ipk" | grep -qx './debian-binary'
+tar -tzf "$ipk" | grep -qx './data.tar.gz'
+tar -tzf "$ipk" | grep -qx './control.tar.gz'
+tar -xOzf "$ipk" ./debian-binary | grep -qx '2.0'
+tar -xOzf "$ipk" ./control.tar.gz > "$work_dir/verify-control.tar.gz"
+tar -tzf "$work_dir/verify-control.tar.gz" | grep -qx './control'
+tar -xOzf "$work_dir/verify-control.tar.gz" ./control | grep -qx "Package: $PACKAGE_NAME"
+tar -xOzf "$ipk" ./data.tar.gz > "$work_dir/verify-data.tar.gz"
+tar -tzf "$work_dir/verify-data.tar.gz" | grep -qx './usr/libexec/glinet-crossmodel-backup'
+tar -tzf "$work_dir/verify-data.tar.gz" | grep -qx './usr/libexec/glinet-crossmodel-remote'
 
-# Write a classic ar archive manually. GNU ar appends `/` to member names;
-# GL.iNet's older opkg package reader rejects that variant. These headers use
-# plain fixed-width names exactly: debian-binary, control.tar.gz, data.tar.gz.
-def ar_member(member_name: str, content: bytes) -> bytes:
-    if len(member_name.encode('ascii')) > 16:
-        raise ValueError(member_name)
-    header = (
-        member_name.encode('ascii').ljust(16, b' ') +
-        b'0'.ljust(12, b' ') +
-        b'0'.ljust(6, b' ') +
-        b'0'.ljust(6, b' ') +
-        b'100644'.ljust(8, b' ') +
-        str(len(content)).encode('ascii').ljust(10, b' ') +
-        b'`\n'
-    )
-    if len(header) != 60:
-        raise ValueError('bad ar header')
-    return header + content + (b'\n' if len(content) % 2 else b'')
-
-archive = b'!<arch>\n' + b''.join([
-    ar_member('debian-binary', b'2.0\n'),
-    ar_member('control.tar.gz', control_tar),
-    ar_member('data.tar.gz', data_tar),
-])
-ipk.write_bytes(archive)
-
-# Verify the exact layout that legacy opkg expects before publishing.
-assert archive.startswith(b'!<arch>\n')
-offset = 8
-members: list[tuple[str, bytes]] = []
-while offset + 60 <= len(archive):
-    header = archive[offset:offset + 60]
-    member_name = header[:16].decode('ascii').rstrip(' ')
-    member_size = int(header[48:58].decode('ascii').strip())
-    offset += 60
-    member = archive[offset:offset + member_size]
-    members.append((member_name, member))
-    offset += member_size + (member_size % 2)
-assert [entry[0] for entry in members] == ['debian-binary', 'control.tar.gz', 'data.tar.gz']
-assert members[0][1] == b'2.0\n'
-with tarfile.open(fileobj=io.BytesIO(members[1][1]), mode='r:gz') as archive_file:
-    assert archive_file.getnames() == ['control', 'postinst']
-with tarfile.open(fileobj=io.BytesIO(members[2][1]), mode='r:gz') as archive_file:
-    names = archive_file.getnames()
-    assert 'usr/libexec/glinet-crossmodel-backup' in names
-    assert 'usr/libexec/glinet-crossmodel-remote' in names
-    assert all(not item.startswith('./') for item in names)
-
-print(f'Built {ipk}')
-PY
+echo "Built $ipk"
