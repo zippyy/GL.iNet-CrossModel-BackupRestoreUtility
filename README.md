@@ -9,7 +9,6 @@ It creates a portable JSON profile rather than a raw firmware backup. The tool v
 ```bash
 git clone https://github.com/zippyy/GL.iNet-CrossModel-BackupRestoreUtility.git
 cd GL.iNet-CrossModel-BackupRestoreUtility
-cp .env.example .env
 docker compose up -d --build
 ```
 
@@ -19,5 +18,5 @@ Open `http://127.0.0.1:8787` locally, or put the service behind an authenticated
 
 - Backups can contain Wi-Fi passwords, VPN keys, DDNS tokens, and AdGuard credentials.
 - Router credentials are used for the request and are not written to saved profiles.
-- Restore creates a target-side emergency profile first unless disabled.
-- Hardware-specific interface names, radio paths, switch-port/VLAN layout, users, and raw firmware settings are not cloned.
+- Network device names, switch-port/VLAN layout, users, firmware settings, and other hardware-specific values are not auto-restored across models.
+- Validate first and review every warning before restoring configuration to a production router.
