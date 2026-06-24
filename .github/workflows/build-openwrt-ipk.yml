@@ -41,7 +41,7 @@ jobs:
           ar p "$ipk" control.tar.gz | tar -xOzf - ./control | tee /tmp/control
           grep -q '^Package: luci-app-glinet-crossmodel-backup$' /tmp/control
           grep -q '^Architecture: all$' /tmp/control
-          grep -q '^Depends: .*,' /tmp/control
+          grep -q '^Depends: luci-base$' /tmp/control
           ar p "$ipk" data.tar.gz | tar -tzf - | grep -q '^./usr/libexec/glinet-crossmodel-backup$'
           ar p "$ipk" data.tar.gz | tar -tzf - | grep -q '^./usr/libexec/glinet-crossmodel-remote$'
           sha256sum "$ipk"
@@ -85,5 +85,5 @@ jobs:
 
 Download the **.ipk** asset from this prerelease and upload that file to GL.iNet Package Manager. Do not upload the GitHub Actions artifact ZIP; extract the IPK from an artifact ZIP first.
 
-The package is architecture-independent, but install it only on a GL.iNet/OpenWrt router whose configured package feeds provide the dependencies listed in the release checksum's matching IPK." \
+The package only declares luci-base as a hard dependency for broad GL.iNet opkg compatibility. The native helper checks for optional local tools when a feature needs them." \
             --prerelease
