@@ -1,4 +1,4 @@
-name: Build GL.iNet IPK
+name: Build and Release GL.iNet IPK
 
 on:
   workflow_dispatch:
@@ -9,8 +9,11 @@ on:
       - 'scripts/build-openwrt-ipk.sh'
       - '.github/workflows/build-openwrt-ipk.yml'
 
+permissions:
+  contents: write
+
 jobs:
-  build:
+  build-and-release:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,11 +23,42 @@ jobs:
           chmod +x scripts/build-openwrt-ipk.sh
           scripts/build-openwrt-ipk.sh
 
-      - name: Inspect package
+      - name: Validate GL.iNet package
         run: |
-          set -e
-          ls -lh dist
-          tar -tzf dist/*.ipk
+          set -euo pipefail
+          ipk=$(find dist -maxdepth 1 -type f -name '*.ipk' | head -n1)
+          test -n "$ipk"
+          tar -tzf "$ipk" | grep -qx './debian-binary'
+          tar -tzf "$ipk" | grep -qx './data.tar.gz'
+          tar -tzf "$ipk" | grep -qx './control.tar.gz'
+          test "$(tar -xOzf "$ipk" ./debian-binary)" = '2.0'
+
+      - name: Read package version
+        id: package
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^PKG_VERSION:=//p' openwrt/luci-app-glinet-crossmodel-backup/Makefile | head -n1)
+          release=$(sed -n 's/^PKG_RELEASE:=//p' openwrt/luci-app-glinet-crossmodel-backup/Makefile | head -n1)
+          test -n "$version"
+          test -n "$release"
+          echo "tag=v${version}-${release}" >> "$GITHUB_OUTPUT"
+          echo "title=GL.iNet Cross-Model Backup ${version}-${release}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.package.outputs.tag }}
+          TITLE: ${{ steps.package.outputs.title }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.ipk dist/*.ipk.sha256 --clobber
+          else
+            gh release create "$TAG" dist/*.ipk dist/*.ipk.sha256 \
+              --target "$GITHUB_SHA" \
+              --title "$TITLE" \
+              --generate-notes
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
