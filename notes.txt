@@ -1,1 +1,1 @@
-glinet portable backup project
+Cross-model GL.iNet configuration migration utility.
