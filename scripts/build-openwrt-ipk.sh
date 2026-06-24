@@ -24,9 +24,9 @@ title="$(sed -n 's/^  TITLE:=//p' "$MAKEFILE" | head -n1)"
 depends_words="${depends_raw//+/}"
 read -r -a dependency_list <<< "$depends_words"
 depends=""
-if ((${#dependency_list[@]})); then
-  depends="$(IFS=', '; printf '%s' "${dependency_list[*]}")"
-fi
+for dependency in "${dependency_list[@]}"; do
+  depends+="${depends:+$depends, }$dependency"
+done
 
 work_dir="$(mktemp -d)"
 trap 'rm -rf "$work_dir"' EXIT
