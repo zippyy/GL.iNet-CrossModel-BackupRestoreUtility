@@ -18,14 +18,14 @@ title="$(sed -n 's/^  TITLE:=//p' "$MAKEFILE" | head -n1)"
 [[ -n "$release" ]] || { echo 'PKG_RELEASE not found in OpenWrt package Makefile' >&2; exit 1; }
 [[ -d "$FILES_DIR" ]] || { echo 'OpenWrt package root payload is missing' >&2; exit 1; }
 
-# OpenWrt Makefiles use +pkg-name dependency syntax. The IPK control file
-# requires a comma-separated Depends field; whitespace-separated names create
-# a malformed control stanza that opkg refuses to parse.
+# Legacy GL.iNet opkg builds expect the conventional ", " separator in
+# Debian-style dependency fields. A no-space comma list can be rejected during
+# control-file parsing as a malformed IPK.
 depends_words="${depends_raw//+/}"
 read -r -a dependency_list <<< "$depends_words"
 depends=""
 if ((${#dependency_list[@]})); then
-  depends="$(IFS=,; printf '%s' "${dependency_list[*]}")"
+  depends="$(IFS=', '; printf '%s' "${dependency_list[*]}")"
 fi
 
 work_dir="$(mktemp -d)"
