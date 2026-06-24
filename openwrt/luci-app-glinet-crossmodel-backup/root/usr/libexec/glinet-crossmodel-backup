@@ -46,12 +46,10 @@ safe_relative_path() {
 }
 
 safe_archive_member() {
-	local raw rel
+	local raw
 	raw="${1#./}"
 	case "$raw" in
-		''|*/)
-			return 0
-			;;
+		''|*/) return 0 ;;
 	esac
 	case "$raw" in
 		/*|*'//'*) return 1 ;;
@@ -66,7 +64,7 @@ safe_archive_member() {
 }
 
 json_escape() {
-	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\r//g; s/$/\\n/' | tr -d '\n'
+	printf '%s' "$1" | tr '\r\n' '  ' | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
 router_facts() {
@@ -137,20 +135,18 @@ check_archive_members() {
 	archive="$1"
 	prefix="$2"
 	members="$(mktemp /tmp/glinet-crossmodel-members.XXXXXX)"
-	trap 'rm -f "$members"' RETURN 2>/dev/null || true
-	tar -tzf "$archive" > "$members" 2>/dev/null || die "Profile archive cannot be read"
+	tar -tzf "$archive" > "$members" 2>/dev/null || { rm -f "$members"; die "Profile archive cannot be read"; }
 	while IFS= read -r member || [ -n "$member" ]; do
-		safe_archive_member "$member" || die "Profile archive contains an unsafe member: $member"
+		safe_archive_member "$member" || { rm -f "$members"; die "Profile archive contains an unsafe member: $member"; }
 		if [ -n "$prefix" ]; then
-			case "${member#./}" in "$prefix"|"$prefix"/*) ;; *) die "Profile archive contains data outside $prefix" ;; esac
+			case "${member#./}" in "$prefix"|"$prefix"/*) ;; *) rm -f "$members"; die "Profile archive contains data outside $prefix" ;; esac
 		fi
 	done < "$members"
 	rm -f "$members"
-	trap - RETURN 2>/dev/null || true
 }
 
 create_profile() {
-	local output profile_id categories scripts_input binaries_input work profile uci_dir artifacts_dir package list
+	local output profile_id categories scripts_input binaries_input work profile uci_dir artifacts_dir list
 	output="$1"
 	profile_id="$2"
 	categories="$3"
@@ -232,7 +228,7 @@ extract_artifacts() {
 }
 
 restore_uci() {
-	local profile categories package applied
+	local profile categories package
 	profile="$1"
 	categories="$2"
 	for package in network dhcp wireless wireguard openvpn firewall adguardhome ddns system; do
@@ -244,7 +240,7 @@ restore_uci() {
 			firewall) has_category "$categories" firewall || continue ;;
 			adguardhome) has_category "$categories" adguard || continue ;;
 			ddns) has_category "$categories" ddns || continue ;;
-			system) has_category "$categories" system || continue ;;
+			system) log 'SKIPPED=uci:system:reference-only'; continue ;;
 		esac
 		uci import "$package" < "$profile/uci/$package"
 		log "APPLIED=uci:$package"
