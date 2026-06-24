@@ -4,8 +4,6 @@ PKG_NAME:=luci-app-glinet-crossmodel-backup
 PKG_VERSION:=1.1.0
 PKG_RELEASE:=2
 PKG_LICENSE:=MIT
-PKG_MAINTAINER:=Tech Relay
-PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)
 PKGARCH:=all
 
 include $(INCLUDE_DIR)/package.mk
@@ -15,13 +13,11 @@ define Package/$(PKG_NAME)
   CATEGORY:=LuCI
   SUBMENU:=3. Applications
   TITLE:=GL.iNet Cross-Model Backup / Restore
-  DEPENDS:=+luci-base +uci +opkg +tar +jsonfilter +openssh-client +sshpass
+  DEPENDS:=+luci-base
 endef
 
 define Package/$(PKG_NAME)/description
-Native LuCI utility for creating portable GL.iNet/OpenWrt configuration
-profiles locally or from other LAN routers over SSH, then restoring
-compatible settings onto a selected local or LAN router target.
+Portable GL.iNet and OpenWrt configuration profile utility.
 endef
 
 define Build/Prepare
