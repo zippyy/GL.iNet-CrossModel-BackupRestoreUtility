@@ -1,0 +1,334 @@
+#!/bin/sh
+# Native backend for luci-app-glinet-crossmodel-backup.
+# Profile archives are intentionally portable, not full flash clones.
+
+set -eu
+PATH='/usr/sbin:/usr/bin:/sbin:/bin'
+MAX_FILE_BYTES=$((8 * 1024 * 1024))
+MAX_TOTAL_BYTES=$((32 * 1024 * 1024))
+
+log() { printf '%s\n' "$*"; }
+die() { log "ERROR: $*" >&2; exit 1; }
+usage() {
+	cat >&2 <<'EOF'
+Usage:
+  glinet-crossmodel-backup create <output.tar.gz> <profile-id> <categories-csv> <scripts-list> <binaries-list>
+  glinet-crossmodel-backup restore <input.tar.gz> <categories-csv> <install-packages:0|1> <direct-files:0|1>
+  glinet-crossmodel-backup facts
+EOF
+	exit 2
+}
+
+has_category() {
+	case ",$1," in
+		*",$2,"*) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+safe_relative_path() {
+	local raw rel
+	raw="$1"
+	case "$raw" in
+		/*) rel="${raw#/}" ;;
+		*) return 1 ;;
+	esac
+	case "$rel" in
+		''|*'//'*) return 1 ;;
+	esac
+	case "/$rel/" in
+		*'/./'*|*'/../'*) return 1 ;;
+	esac
+	case "$rel" in
+		*[!A-Za-z0-9._/-]*) return 1 ;;
+	esac
+	printf '%s\n' "$rel"
+}
+
+safe_archive_member() {
+	local raw rel
+	raw="${1#./}"
+	case "$raw" in
+		''|*/)
+			return 0
+			;;
+	esac
+	case "$raw" in
+		/*|*'//'*) return 1 ;;
+	esac
+	case "/$raw/" in
+		*'/./'*|*'/../'*) return 1 ;;
+	esac
+	case "$raw" in
+		*[!A-Za-z0-9._/-]*) return 1 ;;
+	esac
+	return 0
+}
+
+json_escape() {
+	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\r//g; s/$/\\n/' | tr -d '\n'
+}
+
+router_facts() {
+	local model board arch release
+	model="$(cat /tmp/sysinfo/model 2>/dev/null || true)"
+	board="$(cat /tmp/sysinfo/board_name 2>/dev/null || true)"
+	arch="$(uname -m 2>/dev/null || printf unknown)"
+	release="$(ubus call system board 2>/dev/null | jsonfilter -e '@.release.version' 2>/dev/null || true)"
+	[ -n "$model" ] || model="$board"
+	[ -n "$model" ] || model='OpenWrt router'
+	printf '{"format":"glinet-openwrt-portable-profile/v1","created_at":"%s","model":"%s","board":"%s","architecture":"%s","firmware":"%s"}\n' \
+		"$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$(json_escape "$model")" "$(json_escape "$board")" "$(json_escape "$arch")" "$(json_escape "$release")"
+}
+
+facts() {
+	router_facts
+}
+
+save_uci_export() {
+	local package destination
+	package="$1"
+	destination="$2"
+	if uci -q show "$package" >/dev/null 2>&1; then
+		uci -q export "$package" > "$destination" || true
+		[ -s "$destination" ] || rm -f "$destination"
+	fi
+}
+
+validate_artifact_list() {
+	# $1 input newline list; $2 normalized output list; $3 binary-only 0/1
+	local input output binary_only item rel size magic
+	input="$1"
+	output="$2"
+	binary_only="$3"
+	: > "$output"
+	[ -f "$input" ] || return 0
+	while IFS= read -r item || [ -n "$item" ]; do
+		[ -n "$item" ] || continue
+		rel="$(safe_relative_path "$item")" || die "Unsafe custom path: $item"
+		[ -f "/$rel" ] && [ ! -L "/$rel" ] || die "Custom path is not a regular file: /$rel"
+		size="$(wc -c < "/$rel" | tr -d ' ')"
+		case "$size" in ''|*[!0-9]*) die "Could not determine file size: /$rel" ;; esac
+		[ "$size" -le "$MAX_FILE_BYTES" ] || die "Custom file exceeds 8 MB: /$rel"
+		TOTAL_BYTES=$((TOTAL_BYTES + size))
+		[ "$TOTAL_BYTES" -le "$MAX_TOTAL_BYTES" ] || die "All custom files together exceed 32 MB"
+		if [ "$binary_only" = 1 ]; then
+			magic="$(dd if="/$rel" bs=4 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+			[ "$magic" = '7f454c46' ] || die "Custom binary is not an ELF executable: /$rel"
+		fi
+		printf '%s\n' "$rel" >> "$output"
+	done < "$input"
+}
+
+archive_files() {
+	# $1 newline list with safe relative paths; $2 destination archive
+	local list archive
+	list="$1"
+	archive="$2"
+	[ -s "$list" ] || return 0
+	set -- $(cat "$list")
+	[ "$#" -gt 0 ] || return 0
+	tar -C / -czf "$archive" "$@"
+}
+
+check_archive_members() {
+	# $1 archive; $2 required prefix or empty
+	local archive prefix member members
+	archive="$1"
+	prefix="$2"
+	members="$(mktemp /tmp/glinet-crossmodel-members.XXXXXX)"
+	trap 'rm -f "$members"' RETURN 2>/dev/null || true
+	tar -tzf "$archive" > "$members" 2>/dev/null || die "Profile archive cannot be read"
+	while IFS= read -r member || [ -n "$member" ]; do
+		safe_archive_member "$member" || die "Profile archive contains an unsafe member: $member"
+		if [ -n "$prefix" ]; then
+			case "${member#./}" in "$prefix"|"$prefix"/*) ;; *) die "Profile archive contains data outside $prefix" ;; esac
+		fi
+	done < "$members"
+	rm -f "$members"
+	trap - RETURN 2>/dev/null || true
+}
+
+create_profile() {
+	local output profile_id categories scripts_input binaries_input work profile uci_dir artifacts_dir package list
+	output="$1"
+	profile_id="$2"
+	categories="$3"
+	scripts_input="$4"
+	binaries_input="$5"
+	work="$(mktemp -d /tmp/glinet-crossmodel-create.XXXXXX)"
+	profile="$work/profile"
+	uci_dir="$profile/uci"
+	artifacts_dir="$profile/artifacts"
+	TOTAL_BYTES=0
+	trap 'rm -rf "$work"' EXIT INT TERM
+	mkdir -p "$uci_dir" "$artifacts_dir"
+	router_facts > "$profile/meta.json"
+	printf '%s\n' "$categories" > "$profile/categories.txt"
+
+	if has_category "$categories" network; then
+		save_uci_export network "$uci_dir/network"
+		save_uci_export dhcp "$uci_dir/dhcp"
+	fi
+	if has_category "$categories" wireless; then save_uci_export wireless "$uci_dir/wireless"; fi
+	if has_category "$categories" vpn; then
+		save_uci_export wireguard "$uci_dir/wireguard"
+		save_uci_export openvpn "$uci_dir/openvpn"
+	fi
+	if has_category "$categories" firewall; then save_uci_export firewall "$uci_dir/firewall"; fi
+	if has_category "$categories" adguard; then save_uci_export adguardhome "$uci_dir/adguardhome"; fi
+	if has_category "$categories" ddns; then save_uci_export ddns "$uci_dir/ddns"; fi
+	if has_category "$categories" system; then save_uci_export system "$uci_dir/system"; fi
+	if has_category "$categories" packages; then
+		mkdir -p "$profile/packages"
+		opkg list-installed 2>/dev/null > "$profile/packages/manifest.txt" || true
+	fi
+	if has_category "$categories" scripts; then
+		list="$work/scripts.list"
+		validate_artifact_list "$scripts_input" "$list" 0
+		archive_files "$list" "$artifacts_dir/scripts.tar.gz"
+	fi
+	if has_category "$categories" binaries; then
+		list="$work/binaries.list"
+		validate_artifact_list "$binaries_input" "$list" 1
+		archive_files "$list" "$artifacts_dir/binaries.tar.gz"
+	fi
+	printf '%s\n' "$profile_id" > "$profile/profile-id.txt"
+	tar -C "$work" -czf "$output" profile
+	log "CREATED=$output"
+	log "PROFILE_ID=$profile_id"
+	trap - EXIT INT TERM
+	rm -rf "$work"
+}
+
+safe_package_name() {
+	case "$1" in
+		''|*[!A-Za-z0-9+._-]*) return 1 ;;
+		*) return 0 ;;
+	esac
+}
+
+skip_package() {
+	case "$1" in
+		base-files|busybox|dnsmasq|dropbear|firewall|fw4|kernel|libc|libgcc|libpthread|logd|musl|netifd|opkg|procd|rpcd|ubus|uci|uclient-fetch|usign|urngd|wpad*|kmod-*) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+profile_architecture() {
+	local profile
+	profile="$1"
+	grep -o '"architecture":"[^"]*"' "$profile/meta.json" 2>/dev/null | sed 's/"architecture":"//;s/"$//' | head -n1
+}
+
+extract_artifacts() {
+	# $1 artifact archive, $2 destination root
+	local archive destination
+	archive="$1"
+	destination="$2"
+	check_archive_members "$archive" ''
+	mkdir -p "$destination"
+	tar -C "$destination" -xzf "$archive"
+}
+
+restore_uci() {
+	local profile categories package applied
+	profile="$1"
+	categories="$2"
+	for package in network dhcp wireless wireguard openvpn firewall adguardhome ddns system; do
+		[ -f "$profile/uci/$package" ] || continue
+		case "$package" in
+			network|dhcp) has_category "$categories" network || continue ;;
+			wireless) has_category "$categories" wireless || continue ;;
+			wireguard|openvpn) has_category "$categories" vpn || continue ;;
+			firewall) has_category "$categories" firewall || continue ;;
+			adguardhome) has_category "$categories" adguard || continue ;;
+			ddns) has_category "$categories" ddns || continue ;;
+			system) has_category "$categories" system || continue ;;
+		esac
+		uci import "$package" < "$profile/uci/$package"
+		log "APPLIED=uci:$package"
+	done
+	uci commit
+}
+
+restore_packages() {
+	local manifest line package
+	manifest="$1"
+	[ -f "$manifest" ] || return 0
+	opkg update || { log 'SKIPPED=packages:opkg update failed'; return 0; }
+	while IFS= read -r line || [ -n "$line" ]; do
+		package="${line%% *}"
+		safe_package_name "$package" || continue
+		skip_package "$package" && { log "SKIPPED=package:$package:core-or-kmod"; continue; }
+		if opkg status "$package" 2>/dev/null | grep -q 'Status:.*installed'; then
+			continue
+		fi
+		if opkg install "$package"; then
+			log "APPLIED=package:$package"
+		else
+			log "SKIPPED=package:$package:unavailable-or-incompatible"
+		fi
+	done < "$manifest"
+}
+
+restore_profile() {
+	local input categories install_packages direct_files work profile source_arch target_arch stage
+	input="$1"
+	categories="$2"
+	install_packages="$3"
+	direct_files="$4"
+	[ -f "$input" ] || die 'Uploaded profile archive is missing'
+	check_archive_members "$input" profile
+	work="$(mktemp -d /tmp/glinet-crossmodel-restore.XXXXXX)"
+	trap 'rm -rf "$work"' EXIT INT TERM
+	tar -C "$work" -xzf "$input"
+	profile="$work/profile"
+	[ -f "$profile/meta.json" ] || die 'Profile archive does not contain metadata'
+	restore_uci "$profile" "$categories"
+	if has_category "$categories" packages && [ "$install_packages" = 1 ]; then
+		restore_packages "$profile/packages/manifest.txt"
+	fi
+	source_arch="$(profile_architecture "$profile")"
+	target_arch="$(uname -m 2>/dev/null || printf unknown)"
+	stage="/root/glinet-crossmodel-restore/$(date +%Y%m%d-%H%M%S)"
+	if has_category "$categories" scripts && [ -f "$profile/artifacts/scripts.tar.gz" ]; then
+		if [ "$direct_files" = 1 ]; then
+			extract_artifacts "$profile/artifacts/scripts.tar.gz" /
+			log 'APPLIED=scripts:original-paths'
+		else
+			extract_artifacts "$profile/artifacts/scripts.tar.gz" "$stage/scripts"
+			log "STAGED=$stage/scripts"
+		fi
+	fi
+	if has_category "$categories" binaries && [ -f "$profile/artifacts/binaries.tar.gz" ]; then
+		if [ -z "$source_arch" ] || [ "$source_arch" != "$target_arch" ]; then
+			log "SKIPPED=binaries:source-$source_arch-target-$target_arch"
+		elif [ "$direct_files" = 1 ]; then
+			extract_artifacts "$profile/artifacts/binaries.tar.gz" /
+			log 'APPLIED=binaries:original-paths'
+		else
+			extract_artifacts "$profile/artifacts/binaries.tar.gz" "$stage/binaries"
+			log "STAGED=$stage/binaries"
+		fi
+	fi
+	if has_category "$categories" firewall; then /etc/init.d/firewall restart 2>/dev/null || true; fi
+	if has_category "$categories" wireless; then wifi reload 2>/dev/null || true; fi
+	log "SOURCE_ARCH=$source_arch"
+	log "TARGET_ARCH=$target_arch"
+	trap - EXIT INT TERM
+	rm -rf "$work"
+}
+
+case "${1:-}" in
+	facts) facts ;;
+	create)
+		[ "$#" -eq 6 ] || usage
+		create_profile "$2" "$3" "$4" "$5" "$6"
+		;;
+	restore)
+		[ "$#" -eq 5 ] || usage
+		restore_profile "$2" "$3" "$4" "$5"
+		;;
+	*) usage ;;
+esac
