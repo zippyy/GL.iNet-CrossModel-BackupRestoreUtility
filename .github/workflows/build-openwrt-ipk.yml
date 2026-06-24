@@ -30,16 +30,21 @@ jobs:
           chmod +x scripts/build-openwrt-ipk.sh
           scripts/build-openwrt-ipk.sh
 
-      - name: Inspect package
+      - name: Verify opkg package layout
+        shell: bash
         run: |
-          ls -lh dist/*.ipk
-          ar t dist/*.ipk
-          mkdir -p inspect/control inspect/data
-          cp dist/*.ipk inspect/package.ipk
-          cd inspect
-          ar x package.ipk
-          tar -tzf control.tar.gz
-          tar -tzf data.tar.gz | sed -n '1,80p'
+          set -euo pipefail
+          ipk="$(find dist -maxdepth 1 -name '*.ipk' -type f -print -quit)"
+          test -n "$ipk"
+          test "$(ar t "$ipk" | tr '\n' ' ')" = 'debian-binary control.tar.gz data.tar.gz '
+          test "$(ar p "$ipk" debian-binary)" = '2.0'
+          ar p "$ipk" control.tar.gz | tar -xOzf - ./control | tee /tmp/control
+          grep -q '^Package: luci-app-glinet-crossmodel-backup$' /tmp/control
+          grep -q '^Architecture: all$' /tmp/control
+          grep -q '^Depends: .*,' /tmp/control
+          ar p "$ipk" data.tar.gz | tar -tzf - | grep -q '^./usr/libexec/glinet-crossmodel-backup$'
+          ar p "$ipk" data.tar.gz | tar -tzf - | grep -q '^./usr/libexec/glinet-crossmodel-remote$'
+          sha256sum "$ipk"
 
       - name: Set release metadata
         id: release
@@ -61,7 +66,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: glinet-crossmodel-backup-openwrt-ipk
-          path: dist/*.ipk
+          path: |
+            dist/*.ipk
+            dist/*.ipk.sha256
           if-no-files-found: error
           retention-days: 90
 
@@ -71,8 +78,12 @@ jobs:
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
           RELEASE_TITLE: ${{ steps.release.outputs.title }}
         run: |
-          gh release create "$RELEASE_TAG" dist/*.ipk \
+          gh release create "$RELEASE_TAG" dist/*.ipk dist/*.ipk.sha256 \
             --target "$GITHUB_SHA" \
             --title "$RELEASE_TITLE" \
-            --notes "Automated native OpenWrt IPK build from commit $GITHUB_SHA. This IPK is architecture-independent, but install it only on a GL.iNet/OpenWrt router with compatible package feeds for its declared dependencies." \
+            --notes "Automated native OpenWrt IPK build from commit $GITHUB_SHA.
+
+Download the **.ipk** asset from this prerelease and upload that file to GL.iNet Package Manager. Do not upload the GitHub Actions artifact ZIP; extract the IPK from an artifact ZIP first.
+
+The package is architecture-independent, but install it only on a GL.iNet/OpenWrt router whose configured package feeds provide the dependencies listed in the release checksum's matching IPK." \
             --prerelease
