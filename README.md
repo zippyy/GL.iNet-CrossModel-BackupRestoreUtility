@@ -1,36 +1,44 @@
-# GL.iNet Cross-Model Backup / Restore Utility
+# GL.iNet Cross-Model Backup / Restore Utility — Native OpenWrt branch
 
-A self-hosted utility for moving portable GL.iNet configuration between router models over SSH and UCI.
+This `OpenWRT` branch packages the utility as a native LuCI application that can be compiled into an IPK for GL.iNet/OpenWrt routers. It does **not** require Docker, Node.js, or a separately hosted web service.
 
-It creates a portable JSON profile rather than a raw firmware backup. Profiles can include network, wireless, VPN, firewall, AdGuard Home, DDNS, and limited system UCI data plus optional package manifests, custom scripts/files, and custom ELF binaries.
+Install the generated IPK on the source router to create a portable profile archive, then install the same IPK on the target router to upload and restore compatible settings locally.
 
-## Deploy
+## Build the IPK
 
-```bash
-git clone --branch dev https://github.com/zippyy/GL.iNet-CrossModel-BackupRestoreUtility.git
+Use an OpenWrt SDK that matches the target router's firmware release, target/subtarget, ABI, and package architecture.
+
+```sh
+git clone --branch OpenWRT https://github.com/zippyy/GL.iNet-CrossModel-BackupRestoreUtility.git
 cd GL.iNet-CrossModel-BackupRestoreUtility
-docker compose up -d --build
+
+cp -a openwrt/luci-app-glinet-crossmodel-backup /path/to/openwrt-sdk/package/
+cd /path/to/openwrt-sdk
+./scripts/feeds update -a
+./scripts/feeds install -a
+make defconfig
+make package/luci-app-glinet-crossmodel-backup/compile V=s
 ```
 
-Open `http://127.0.0.1:8787` locally, or put the service behind an authenticated reverse proxy.
+The generated IPK appears under `bin/packages/<architecture>/...` inside the SDK.
 
-## Optional portable artifacts
+## Install on a GL.iNet router
 
-### Installed packages
+```sh
+opkg install /tmp/luci-app-glinet-crossmodel-backup_*.ipk
+/etc/init.d/uhttpd restart
+```
 
-Selecting **Installed package manifest** records package names and source versions from `opkg list-installed`; it does not copy `.ipk` archives. During restore, the tool only installs missing non-core packages when you explicitly enable package installation. It runs `opkg update`, then resolves compatible versions from the target router's configured feeds. Kernel, `kmod-*`, and core platform packages are skipped.
+Open LuCI and go to **Services → GL.iNet Cross-Model Backup**.
 
-### Custom scripts and files
+## Native portable profile contents
 
-List one absolute regular-file path per line, such as `/root/fix-vpn.sh`, `/etc/rc.local`, or `/usr/local/bin/router-health`. Each file is capped at 8 MB and all selected scripts/binaries together are capped at 32 MB. On restore they are staged under `/root/glinet-portable-restore/<profile-id>/` by default. Enable direct restore only after reviewing the target paths.
+The app creates a `.tar.gz` archive with selected UCI exports and source metadata. It can also include:
 
-### ELF binaries
+- An installed-package manifest. The target runs `opkg update` and installs only missing, compatible non-core/non-kmod packages when explicitly enabled.
+- Explicit custom scripts and regular files. Each file is capped at 8 MB; all custom files together are capped at 32 MB. They stage under `/root/glinet-crossmodel-restore/` by default.
+- Explicit custom ELF binaries. Restore is blocked if the source and target `uname -m` architectures do not match.
 
-List explicit ELF binary paths separately. Direct binary restore is allowed only where the source and target `uname -m` architecture match. This prevents accidental MIPS, ARM, or x86 binary deployment onto incompatible router hardware.
+## Intentionally not cloned
 
-## Safety
-
-- Backups can contain Wi-Fi passwords, VPN keys, DDNS tokens, AdGuard credentials, package names, and the contents of every custom file selected.
-- Router credentials are used for the request and are not written to saved profiles.
-- Network device names, switch-port/VLAN layout, users, firmware settings, and other hardware-specific values are not automatically restored across models.
-- Validate first and review every warning before restoring configuration to a production router.
+Firmware, kernel modules, physical ports, DSA/switch/VLAN topology, hardware-specific interface names, device identity, users, passwords, SSH host keys, and raw flash configuration are not copied automatically.
