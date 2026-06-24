@@ -3,12 +3,13 @@
 This directory is a package feed-style source tree for a native LuCI application:
 
 - Package name: `luci-app-glinet-crossmodel-backup`
-- Runtime: native BusyBox, UCI, opkg, tar, and LuCI — no Docker, Node.js, or external SSH service
-- Workflow: install the IPK on the source router to create a portable archive, then install it on the target router to upload, validate, and restore it locally.
+- Runtime: native BusyBox, UCI, opkg, tar, LuCI, OpenSSH client, and sshpass — no Docker, Node.js, or separately hosted service
+- Control-router workflow: install the IPK once on a main router, then manage that router itself or other reachable GL.iNet/OpenWrt LAN routers over SSH
+- Remote routers do not need the IPK. The control router streams the small native backend script for an active job, retrieves profiles, and removes its temporary remote files when finished.
 
 ## Build with an OpenWrt SDK
 
-Use an SDK matching the target router's **OpenWrt release, target/subtarget, ABI, and package architecture**. A GL.iNet firmware package must be built against the same GL.iNet SDK/feed set when GL.iNet-specific ABI packages are involved.
+Use an SDK matching the **control router's** OpenWrt release, target/subtarget, ABI, and package architecture. A GL.iNet firmware package should be built against the same GL.iNet SDK/feed set when GL.iNet-specific ABI packages are involved.
 
 ```sh
 git clone --branch OpenWRT https://github.com/zippyy/GL.iNet-CrossModel-BackupRestoreUtility.git
@@ -27,9 +28,7 @@ make package/luci-app-glinet-crossmodel-backup/compile V=s
 
 The IPK is written below the SDK's `bin/packages/<arch>/...` path.
 
-## Install
-
-Copy the correctly built IPK to the router, then run:
+## Install on the control router
 
 ```sh
 opkg install /tmp/luci-app-glinet-crossmodel-backup_*.ipk
@@ -37,6 +36,10 @@ opkg install /tmp/luci-app-glinet-crossmodel-backup_*.ipk
 ```
 
 Open the router's LuCI interface and select **Services → GL.iNet Cross-Model Backup**.
+
+## LAN SSH workflow
+
+Enable the SSH source or target toggle in LuCI, enter a LAN address, SSH port, username, and password, and run the connection test. The control router uses `sshpass` with a temporary mode-0600 password file; it does not save submitted credentials. New SSH host keys are stored in `/root/.ssh/known_hosts`; changed keys fail validation instead of being silently trusted.
 
 ## Native profile format
 
