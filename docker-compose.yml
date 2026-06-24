@@ -1,0 +1,9 @@
+services:
+  glinet-crossmodel-backup:
+    build: .
+    container_name: glinet-crossmodel-backup
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8787:8787"
+    volumes:
+      - ./data:/app/data
