@@ -15,7 +15,7 @@ define Package/$(PKG_NAME)
   CATEGORY:=LuCI
   SUBMENU:=3. Applications
   TITLE:=GL.iNet Cross-Model Backup / Restore
-  DEPENDS:=+luci-base +uci +opkg +tar
+  DEPENDS:=+luci-base +uci +opkg +tar +jsonfilter
 endef
 
 define Package/$(PKG_NAME)/description
