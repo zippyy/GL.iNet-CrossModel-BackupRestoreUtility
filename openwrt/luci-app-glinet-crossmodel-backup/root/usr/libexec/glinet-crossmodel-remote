@@ -85,8 +85,8 @@ prepare_connection() {
 	[ -f "$passfile" ] || die 'Temporary SSH credential file is missing.'
 	[ -x "$APP" ] || die 'Native backup backend is missing.'
 	command -v ssh >/dev/null 2>&1 || die 'OpenSSH client is not installed.'
-	command -v scp >/dev/null 2>&1 || die 'OpenSSH scp client is not installed.'
 	command -v sshpass >/dev/null 2>&1 || die 'sshpass is not installed.'
+	command -v base64 >/dev/null 2>&1 || die 'base64 is not available on the control router.'
 	mkdir -p /root/.ssh
 	chmod 700 /root/.ssh
 }
@@ -106,32 +106,25 @@ ssh_run() {
 		-p "$port" "$target" "$@"
 }
 
-scp_to() {
-	# local host port user passfile remote-path
-	local local_file host port user passfile remote_path target
+copy_to_remote() {
+	# local-file host port user passfile remote-path
+	local local_file host port user passfile remote_path
 	local_file="$1"; host="$2"; port="$3"; user="$4"; passfile="$5"; remote_path="$6"
-	target="$(remote_target "$host" "$user")"
-	sshpass -f "$passfile" scp \
-		-o ConnectTimeout=12 \
-		-o ServerAliveInterval=5 \
-		-o ServerAliveCountMax=2 \
-		-o StrictHostKeyChecking=accept-new \
-		-o UserKnownHostsFile="$KNOWN_HOSTS" \
-		-P "$port" "$local_file" "$target:$remote_path"
+	[ -f "$local_file" ] || die "Local input is missing: $local_file"
+	base64 "$local_file" | ssh_run "$host" "$port" "$user" "$passfile" "umask 077; base64 -d > '$remote_path'"
 }
 
-scp_from() {
-	# host port user passfile remote-path local
-	local host port user passfile remote_path local_file target
+copy_from_remote() {
+	# host port user passfile remote-path local-file
+	local host port user passfile remote_path local_file encoded
 	host="$1"; port="$2"; user="$3"; passfile="$4"; remote_path="$5"; local_file="$6"
-	target="$(remote_target "$host" "$user")"
-	sshpass -f "$passfile" scp \
-		-o ConnectTimeout=12 \
-		-o ServerAliveInterval=5 \
-		-o ServerAliveCountMax=2 \
-		-o StrictHostKeyChecking=accept-new \
-		-o UserKnownHostsFile="$KNOWN_HOSTS" \
-		-P "$port" "$target:$remote_path" "$local_file"
+	encoded="$(mktemp /tmp/glinet-crossmodel-download.XXXXXX)"
+	trap 'rm -f "$encoded"' EXIT INT TERM
+	ssh_run "$host" "$port" "$user" "$passfile" "base64 '$remote_path'" > "$encoded"
+	base64 -d "$encoded" > "$local_file"
+	[ -s "$local_file" ] || die 'Remote router created an empty profile archive.'
+	trap - EXIT INT TERM
+	rm -f "$encoded"
 }
 
 stream_backend() {
@@ -163,11 +156,10 @@ remote_create() {
 	trap 'rm -rf "$work"; ssh_run "$host" "$port" "$user" "$passfile" rm -f "$remote_archive" "$remote_scripts" "$remote_binaries" >/dev/null 2>&1 || true' EXIT INT TERM
 	cp "$scripts" "$work/scripts.list"
 	cp "$binaries" "$work/binaries.list"
-	scp_to "$work/scripts.list" "$host" "$port" "$user" "$passfile" "$remote_scripts"
-	scp_to "$work/binaries.list" "$host" "$port" "$user" "$passfile" "$remote_binaries"
+	copy_to_remote "$work/scripts.list" "$host" "$port" "$user" "$passfile" "$remote_scripts"
+	copy_to_remote "$work/binaries.list" "$host" "$port" "$user" "$passfile" "$remote_binaries"
 	stream_backend "$host" "$port" "$user" "$passfile" create "$remote_archive" "$id" "$categories" "$remote_scripts" "$remote_binaries"
-	scp_from "$host" "$port" "$user" "$passfile" "$remote_archive" "$output"
-	[ -s "$output" ] || die 'Remote router created an empty profile archive.'
+	copy_from_remote "$host" "$port" "$user" "$passfile" "$remote_archive" "$output"
 	ssh_run "$host" "$port" "$user" "$passfile" rm -f "$remote_archive" "$remote_scripts" "$remote_binaries"
 	trap - EXIT INT TERM
 	rm -rf "$work"
@@ -186,7 +178,7 @@ remote_restore() {
 	prepare_connection "$host" "$port" "$user" "$passfile"
 	remote_archive="/tmp/glinet-crossmodel-restore-${id}.tar.gz"
 	trap 'ssh_run "$host" "$port" "$user" "$passfile" rm -f "$remote_archive" >/dev/null 2>&1 || true' EXIT INT TERM
-	scp_to "$input" "$host" "$port" "$user" "$passfile" "$remote_archive"
+	copy_to_remote "$input" "$host" "$port" "$user" "$passfile" "$remote_archive"
 	stream_backend "$host" "$port" "$user" "$passfile" restore "$remote_archive" "$categories" "$install_packages" "$direct_files"
 	ssh_run "$host" "$port" "$user" "$passfile" rm -f "$remote_archive"
 	trap - EXIT INT TERM
