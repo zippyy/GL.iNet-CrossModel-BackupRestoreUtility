@@ -20,7 +20,6 @@ concurrency:
 jobs:
   build-ipk:
     runs-on: ubuntu-latest
-
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -55,12 +54,8 @@ jobs:
           release="$(sed -n 's/^PKG_RELEASE:=//p' "$makefile" | head -n 1)"
           test -n "$version"
           test -n "$release"
-
-          tag="openwrt-v${version}-build.${GITHUB_RUN_NUMBER}"
-          title="GL.iNet Cross-Model Backup / Restore ${version}-${release} — OpenWrt build ${GITHUB_RUN_NUMBER}"
-
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "title=$title" >> "$GITHUB_OUTPUT"
+          echo "tag=openwrt-v${version}-build.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "title=GL.iNet Cross-Model Backup / Restore ${version}-${release} - OpenWrt build ${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
 
       - name: Upload IPK artifact
         uses: actions/upload-artifact@v4
@@ -77,13 +72,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
           RELEASE_TITLE: ${{ steps.release.outputs.title }}
+        shell: bash
         run: |
-          gh release create "$RELEASE_TAG" dist/*.ipk dist/*.ipk.sha256 \
-            --target "$GITHUB_SHA" \
-            --title "$RELEASE_TITLE" \
-            --notes "Automated native OpenWrt IPK build from commit $GITHUB_SHA.
-
-Download the **.ipk** asset from this prerelease and upload that file to GL.iNet Package Manager. Do not upload the GitHub Actions artifact ZIP; extract the IPK from an artifact ZIP first.
-
-The package only declares luci-base as a hard dependency for broad GL.iNet opkg compatibility. The native helper checks for optional local tools when a feature needs them." \
-            --prerelease
+          gh release create "$RELEASE_TAG" dist/*.ipk dist/*.ipk.sha256 --target "$GITHUB_SHA" --title "$RELEASE_TITLE" --notes "Automated native OpenWrt IPK build. Download the IPK release asset, not the GitHub Actions artifact ZIP." --prerelease
