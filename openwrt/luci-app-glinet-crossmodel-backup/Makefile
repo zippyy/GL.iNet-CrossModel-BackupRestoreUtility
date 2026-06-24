@@ -37,4 +37,4 @@ endef
 
 $(eval $(call BuildPackage,$(PKG_NAME)))
 
-# Trigger v1.1.0-9 release build.
+# Force v1.1.0-9 build and release.
