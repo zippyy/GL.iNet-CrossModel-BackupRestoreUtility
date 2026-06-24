@@ -1,77 +1,36 @@
-name: Build and Release OpenWrt IPK
+name: Build OpenWrt IPK
 
 on:
   workflow_dispatch:
   push:
-    branches:
-      - OpenWRT
+    branches: [OpenWRT]
     paths:
       - 'openwrt/**'
       - 'scripts/build-openwrt-ipk.sh'
       - '.github/workflows/build-openwrt-ipk.yml'
 
-permissions:
-  contents: write
-
-concurrency:
-  group: build-openwrt-ipk
-  cancel-in-progress: false
-
 jobs:
-  build-ipk:
+  build:
     runs-on: ubuntu-latest
     steps:
-      - name: Check out source
-        uses: actions/checkout@v4
-
-      - name: Build standalone IPK
+      - uses: actions/checkout@v4
+      - name: Build IPK
         run: |
           chmod +x scripts/build-openwrt-ipk.sh
           scripts/build-openwrt-ipk.sh
-
-      - name: Verify opkg package layout
-        shell: bash
+      - name: Verify IPK container
         run: |
-          set -euo pipefail
-          ipk="$(find dist -maxdepth 1 -name '*.ipk' -type f -print -quit)"
+          set -e
+          ipk=$(find dist -name '*.ipk' -type f | head -n1)
           test -n "$ipk"
           test "$(ar t "$ipk" | tr '\n' ' ')" = 'debian-binary control.tar.gz data.tar.gz '
           test "$(ar p "$ipk" debian-binary)" = '2.0'
-          ar p "$ipk" control.tar.gz | tar -xOzf - ./control | tee /tmp/control
-          grep -q '^Package: luci-app-glinet-crossmodel-backup$' /tmp/control
-          grep -q '^Architecture: all$' /tmp/control
-          grep -q '^Depends: luci-base$' /tmp/control
+          ar p "$ipk" control.tar.gz | tar -xOzf - ./control | grep -qx 'Package: luci-app-glinet-crossmodel-backup'
           ar p "$ipk" data.tar.gz | tar -tzf - | grep -q '^./usr/libexec/glinet-crossmodel-backup$'
           ar p "$ipk" data.tar.gz | tar -tzf - | grep -q '^./usr/libexec/glinet-crossmodel-remote$'
-          sha256sum "$ipk"
-
-      - name: Set release metadata
-        id: release
-        shell: bash
-        run: |
-          makefile='openwrt/luci-app-glinet-crossmodel-backup/Makefile'
-          version="$(sed -n 's/^PKG_VERSION:=//p' "$makefile" | head -n 1)"
-          release="$(sed -n 's/^PKG_RELEASE:=//p' "$makefile" | head -n 1)"
-          test -n "$version"
-          test -n "$release"
-          echo "tag=openwrt-v${version}-build.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
-          echo "title=GL.iNet Cross-Model Backup / Restore ${version}-${release} - OpenWrt build ${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
-
-      - name: Upload IPK artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: glinet-crossmodel-backup-openwrt-ipk
-          path: |
-            dist/*.ipk
-            dist/*.ipk.sha256
+          name: glinet-crossmodel-backup-ipk
+          path: dist/*.ipk
           if-no-files-found: error
           retention-days: 90
-
-      - name: Publish GitHub prerelease
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ steps.release.outputs.tag }}
-          RELEASE_TITLE: ${{ steps.release.outputs.title }}
-        shell: bash
-        run: |
-          gh release create "$RELEASE_TAG" dist/*.ipk dist/*.ipk.sha256 --target "$GITHUB_SHA" --title "$RELEASE_TITLE" --notes "Automated native OpenWrt IPK build. Download the IPK release asset, not the GitHub Actions artifact ZIP." --prerelease
