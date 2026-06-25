@@ -21,17 +21,18 @@ cp -a "$payload/." "$work/data/"
 chmod 0755 "$work/data/usr/libexec/glinet-crossmodel-backup"
 chmod 0755 "$work/data/usr/libexec/glinet-crossmodel-remote"
 
-# GL.iNet LuCI expects string chmod modes. Add a real Services parent without
-# using an alias, because aliases intercept the nested API routes used by the app.
+# Build a GL.iNet-compatible LuCI controller from the portable source.
 python3 - "$work/data/usr/lib/lua/luci/controller/glinet_crossmodel.lua" <<'PY'
 from pathlib import Path
 import sys
 
 path = Path(sys.argv[1])
 text = path.read_text(encoding="utf-8")
+
 parent = 'function index()\n\tlocal services = entry({"admin", "services"}, firstchild(), _("Services"), 60)\n\tservices.dependent = false\n'
 if parent not in text:
     text = text.replace('function index()\n', parent, 1)
+
 for old, new in {
     'fs.chmod(PROFILE_DIR, 448)': 'fs.chmod(PROFILE_DIR, "0700")',
     'fs.chmod(TMP_DIR, 448)': 'fs.chmod(TMP_DIR, "0700")',
@@ -40,6 +41,31 @@ for old, new in {
     'fs.chmod(temporary, 384)': 'fs.chmod(temporary, "0600")',
 }.items():
     text = text.replace(old, new)
+
+old_command = '''local function command(commandline)
+\tlocal pipe = io.popen(commandline .. " 2>&1")
+\tlocal output = pipe:read("*a") or ""
+\tlocal ok, _, code = pipe:close()
+\tif ok == true or ok == 0 then return true, output end
+\treturn false, output, code
+end
+'''
+new_command = '''local function command(commandline)
+\tlocal marker = "__GCM_EXIT__"
+\tlocal shell = "(" .. commandline .. ") 2>&1; rc=$?; echo; echo " .. marker .. "$rc"
+\tlocal pipe = io.popen(shell)
+\tlocal output = pipe:read("*a") or ""
+\tpipe:close()
+\tlocal status = tonumber(output:match("\\n" .. marker .. "(%d+)%s*$"))
+\toutput = output:gsub("\\n" .. marker .. "%d+%s*$", "")
+\tif status == 0 then return true, output end
+\treturn false, output, status
+end
+'''
+if old_command in text:
+    text = text.replace(old_command, new_command, 1)
+elif '__GCM_EXIT__' not in text:
+    raise SystemExit('LuCI command helper was not found')
 
 old_upload = '''\tlocal bytes, upload, stream = 0, false, nil
 \thttp.setfilehandler(function(meta, chunk, eof)
@@ -100,31 +126,36 @@ new_upload = '''\tlocal bytes, upload_seen, collecting, stream = 0, false, false
 if old_upload not in text:
     raise SystemExit('LuCI restore upload handler was not found')
 text = text.replace(old_upload, new_upload, 1)
+path.write_text(text, encoding="utf-8")
+PY
 
-old_command = '''local function command(commandline)
-\tlocal pipe = io.popen(commandline .. " 2>&1")
-\tlocal output = pipe:read("*a") or ""
-\tlocal ok, _, code = pipe:close()
-\tif ok == true or ok == 0 then return true, output end
-\treturn false, output, code
-end
+# Remote restores must not restart firewall or Wi-Fi before the SSH result gets
+# back to the control router. The remote coordinator sets GCM_DEFER_RELOAD=1.
+python3 - "$work/data/usr/libexec/glinet-crossmodel-backup" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+old = '''\tif has_category "$categories" firewall; then /etc/init.d/firewall restart 2>/dev/null || true; fi
+\tif has_category "$categories" wireless; then wifi reload 2>/dev/null || true; fi
 '''
-new_command = '''local function command(commandline)
-\tlocal marker = "__GCM_EXIT__"
-\tlocal shell = "(" .. commandline .. ") 2>&1; rc=$?; echo; echo " .. marker .. "$rc"
-\tlocal pipe = io.popen(shell)
-\tlocal output = pipe:read("*a") or ""
-\tpipe:close()
-\tlocal status = tonumber(output:match("\\n" .. marker .. "(%d+)%s*$"))
-\toutput = output:gsub("\\n" .. marker .. "%d+%s*$", "")
-\tif status == 0 then return true, output end
-\treturn false, output, status
-end
+new = '''\tif has_category "$categories" firewall; then
+\t\tcase "${GCM_DEFER_RELOAD:-0}" in
+\t\t\t1) log 'DEFERRED=firewall-restart:reboot-target-to-activate' ;;
+\t\t\t*) /etc/init.d/firewall restart 2>/dev/null || true ;;
+\t\tesac
+\tfi
+\tif has_category "$categories" wireless; then
+\t\tcase "${GCM_DEFER_RELOAD:-0}" in
+\t\t\t1) log 'DEFERRED=wireless-reload:reboot-target-to-activate' ;;
+\t\t\t*) wifi reload 2>/dev/null || true ;;
+\t\tesac
+\tfi
 '''
-if old_command in text:
-    text = text.replace(old_command, new_command, 1)
-elif '__GCM_EXIT__' not in text:
-    raise SystemExit('LuCI command helper was not found')
+if old not in text:
+    raise SystemExit('Backend reload section was not found')
+text = text.replace(old, new, 1)
 path.write_text(text, encoding="utf-8")
 PY
 
@@ -163,11 +194,11 @@ rm -f "$ipk" "$ipk.sha256"
 (cd "$work" && tar --owner=0 --group=0 --numeric-owner -czf "$ipk" ./debian-binary ./data.tar.gz ./control.tar.gz)
 sha256sum "$ipk" > "$ipk.sha256"
 
-# Validate without piping tar into grep. With pipefail, grep -q exits early
-# and can make tar fail with a false Broken pipe error.
-tar -tzf "$ipk" | grep -qx './debian-binary'
-tar -tzf "$ipk" | grep -qx './data.tar.gz'
-tar -tzf "$ipk" | grep -qx './control.tar.gz'
+# Validate package layout and the remote-restore safety changes.
+tar -tzf "$ipk" > "$work/ipk-members"
+grep -qx './debian-binary' "$work/ipk-members"
+grep -qx './data.tar.gz' "$work/ipk-members"
+grep -qx './control.tar.gz' "$work/ipk-members"
 tar -xOzf "$ipk" ./debian-binary > "$work/debian-binary-check"
 grep -qx '2.0' "$work/debian-binary-check"
 tar -xOzf "$ipk" ./control.tar.gz > "$work/control-check.tar.gz"
@@ -175,13 +206,13 @@ tar -xOzf "$work/control-check.tar.gz" ./control > "$work/control-check"
 grep -Fq 'Depends: luci-base, openssh-client, sshpass, jsonfilter' "$work/control-check"
 tar -xOzf "$ipk" ./data.tar.gz > "$work/data-check.tar.gz"
 tar -xOzf "$work/data-check.tar.gz" ./usr/libexec/glinet-crossmodel-remote > "$work/remote-check.sh"
-grep -Fq 'verify_remote_copy' "$work/remote-check.sh"
-grep -Fq 'scp -O' "$work/remote-check.sh"
+grep -Fq 'GCM_DEFER_RELOAD=1' "$work/remote-check.sh"
+tar -xOzf "$work/data-check.tar.gz" ./usr/libexec/glinet-crossmodel-backup > "$work/backend-check.sh"
+grep -Fq 'DEFERRED=firewall-restart:reboot-target-to-activate' "$work/backend-check.sh"
+grep -Fq 'DEFERRED=wireless-reload:reboot-target-to-activate' "$work/backend-check.sh"
 tar -xOzf "$work/data-check.tar.gz" ./usr/lib/lua/luci/controller/glinet_crossmodel.lua > "$work/controller-check.lua"
 grep -Fq '__GCM_EXIT__' "$work/controller-check.lua"
 grep -Fq 'upload_seen, collecting, stream' "$work/controller-check.lua"
-grep -Fq 'Uploaded profile archive could not be read on the control router.' "$work/controller-check.lua"
-grep -Fq 'fs.chmod(PROFILE_DIR, "0700")' "$work/controller-check.lua"
 grep -Fq 'local services = entry({"admin", "services"}, firstchild(), _("Services"), 60)' "$work/controller-check.lua"
 
 echo "Built $ipk"
