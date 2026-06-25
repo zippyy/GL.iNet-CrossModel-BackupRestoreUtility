@@ -41,24 +41,84 @@ for old, new in {
 }.items():
     text = text.replace(old, new)
 
+old_upload = '''\tlocal bytes, upload, stream = 0, false, nil
+\thttp.setfilehandler(function(meta, chunk, eof)
+\t\tif meta and meta.name == "archive" then
+\t\t\tupload = true
+\t\t\tstream = io.open(temporary, "wb")
+\t\tend
+\t\tif upload and stream and chunk and #chunk > 0 then
+\t\t\tbytes = bytes + #chunk
+\t\t\tif bytes <= 64 * 1024 * 1024 then stream:write(chunk) end
+\t\tend
+\t\tif upload and eof and stream then stream:close(); stream = nil end
+\tend)
+\thttp.formvalue("archive")
+\tif stream then stream:close() end
+\tif not upload or bytes == 0 or bytes > 64 * 1024 * 1024 or not fs.access(temporary) then
+\t\tfs.unlink(temporary)
+\t\treturn write_json({ error = "Upload a portable profile archive smaller than 64 MB." }, 400)
+\tend
+\tfs.chmod(temporary, "0600")
+'''
+new_upload = '''\tlocal bytes, upload_seen, collecting, stream = 0, false, false, nil
+\thttp.setfilehandler(function(meta, chunk, eof)
+\t\tif meta then
+\t\t\tif meta.name == "archive" then
+\t\t\t\tupload_seen = true
+\t\t\t\tif not collecting then
+\t\t\t\t\tstream = io.open(temporary, "wb")
+\t\t\t\t\tcollecting = stream ~= nil
+\t\t\t\tend
+\t\t\telse
+\t\t\t\tif collecting and stream then stream:close(); stream = nil end
+\t\t\t\tcollecting = false
+\t\t\tend
+\t\tend
+\t\tif collecting and stream and chunk and #chunk > 0 then
+\t\t\tbytes = bytes + #chunk
+\t\t\tif bytes <= 64 * 1024 * 1024 then stream:write(chunk) end
+\t\tend
+\t\tif collecting and eof then
+\t\t\tif stream then stream:close(); stream = nil end
+\t\t\tcollecting = false
+\t\tend
+\tend)
+\thttp.formvalue("archive")
+\tif stream then stream:close() end
+\tif not upload_seen or bytes == 0 or bytes > 64 * 1024 * 1024 or not fs.access(temporary) then
+\t\tfs.unlink(temporary)
+\t\treturn write_json({ error = "Upload a portable profile archive smaller than 64 MB." }, 400)
+\tend
+\tfs.chmod(temporary, "0600")
+\tlocal readable = command("tar -tzf " .. quote(temporary) .. " >/dev/null")
+\tif not readable then
+\t\tfs.unlink(temporary)
+\t\treturn write_json({ error = "Uploaded profile archive could not be read on the control router." }, 400)
+\tend
+'''
+if old_upload not in text:
+    raise SystemExit('LuCI restore upload handler was not found')
+text = text.replace(old_upload, new_upload, 1)
+
 old_command = '''local function command(commandline)
-	local pipe = io.popen(commandline .. " 2>&1")
-	local output = pipe:read("*a") or ""
-	local ok, _, code = pipe:close()
-	if ok == true or ok == 0 then return true, output end
-	return false, output, code
+\tlocal pipe = io.popen(commandline .. " 2>&1")
+\tlocal output = pipe:read("*a") or ""
+\tlocal ok, _, code = pipe:close()
+\tif ok == true or ok == 0 then return true, output end
+\treturn false, output, code
 end
 '''
 new_command = '''local function command(commandline)
-	local marker = "__GCM_EXIT__"
-	local shell = "(" .. commandline .. ") 2>&1; rc=$?; echo; echo " .. marker .. "$rc"
-	local pipe = io.popen(shell)
-	local output = pipe:read("*a") or ""
-	pipe:close()
-	local status = tonumber(output:match("\\n" .. marker .. "(%d+)%s*$"))
-	output = output:gsub("\\n" .. marker .. "%d+%s*$", "")
-	if status == 0 then return true, output end
-	return false, output, status
+\tlocal marker = "__GCM_EXIT__"
+\tlocal shell = "(" .. commandline .. ") 2>&1; rc=$?; echo; echo " .. marker .. "$rc"
+\tlocal pipe = io.popen(shell)
+\tlocal output = pipe:read("*a") or ""
+\tpipe:close()
+\tlocal status = tonumber(output:match("\\n" .. marker .. "(%d+)%s*$"))
+\toutput = output:gsub("\\n" .. marker .. "%d+%s*$", "")
+\tif status == 0 then return true, output end
+\treturn false, output, status
 end
 '''
 if old_command in text:
@@ -119,7 +179,8 @@ grep -Fq 'verify_remote_copy' "$work/remote-check.sh"
 grep -Fq 'scp -O' "$work/remote-check.sh"
 tar -xOzf "$work/data-check.tar.gz" ./usr/lib/lua/luci/controller/glinet_crossmodel.lua > "$work/controller-check.lua"
 grep -Fq '__GCM_EXIT__' "$work/controller-check.lua"
-grep -Fq 'local shell = "(" .. commandline .. ") 2>&1; rc=$?; echo; echo " .. marker .. "$rc"' "$work/controller-check.lua"
+grep -Fq 'upload_seen, collecting, stream' "$work/controller-check.lua"
+grep -Fq 'Uploaded profile archive could not be read on the control router.' "$work/controller-check.lua"
 grep -Fq 'fs.chmod(PROFILE_DIR, "0700")' "$work/controller-check.lua"
 grep -Fq 'local services = entry({"admin", "services"}, firstchild(), _("Services"), 60)' "$work/controller-check.lua"
 
