@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-glinet-crossmodel-backup
 PKG_VERSION:=1.1.0
-PKG_RELEASE:=16
+PKG_RELEASE:=17
 PKG_LICENSE:=MIT
 PKGARCH:=all
 
@@ -33,6 +33,7 @@ define Package/$(PKG_NAME)/install
 	$(CP) $(PKG_BUILD_DIR)/. $(1)/
 	chmod 0755 $(1)/usr/libexec/glinet-crossmodel-backup
 	chmod 0755 $(1)/usr/libexec/glinet-crossmodel-remote
+	chmod 0755 $(1)/usr/libexec/glinet-crossmodel-validate
 endef
 
 $(eval $(call BuildPackage,$(PKG_NAME)))
