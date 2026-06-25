@@ -21,14 +21,14 @@ cp -a "$payload/." "$work/data/"
 chmod 0755 "$work/data/usr/libexec/glinet-crossmodel-backup"
 chmod 0755 "$work/data/usr/libexec/glinet-crossmodel-remote"
 
-python3 - "$work/data/usr/lib/lua/luci/controller/glinet_crossmodel.lua" "$work/data/usr/libexec/glinet-crossmodel-remote" <<'PY'
+# GL.iNet LuCI expects string chmod modes. Add the parent menu without using
+# an alias, because aliases intercept the nested /api routes used by the app.
+python3 - "$work/data/usr/lib/lua/luci/controller/glinet_crossmodel.lua" <<'PY'
 from pathlib import Path
 import sys
 
-controller = Path(sys.argv[1])
-remote = Path(sys.argv[2])
-
-text = controller.read_text(encoding="utf-8")
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
 parent = 'function index()\n\tlocal services = entry({"admin", "services"}, firstchild(), _("Services"), 60)\n\tservices.dependent = false\n'
 if parent not in text:
     text = text.replace('function index()\n', parent, 1)
@@ -40,54 +40,7 @@ for old, new in {
     'fs.chmod(temporary, 384)': 'fs.chmod(temporary, "0600")',
 }.items():
     text = text.replace(old, new)
-controller.write_text(text, encoding="utf-8")
-
-text = remote.read_text(encoding="utf-8")
-text = text.replace(
-    "\tcommand -v ssh >/dev/null 2>&1 || die 'OpenSSH client is not installed.'\n"
-    "\tcommand -v sshpass >/dev/null 2>&1 || die 'sshpass is not installed.'\n"
-    "\tcommand -v base64 >/dev/null 2>&1 || die 'base64 is not available on the control router.'\n",
-    "\tcommand -v ssh >/dev/null 2>&1 || die 'OpenSSH client is not installed.'\n"
-    "\tcommand -v scp >/dev/null 2>&1 || die 'OpenSSH SCP client is not installed.'\n"
-    "\tcommand -v sshpass >/dev/null 2>&1 || die 'sshpass is not installed.'\n"
-)
-start = text.index('copy_to_remote() {')
-end = text.index('\nstream_backend() {', start)
-replacement = '''copy_to_remote() {
-	# local-file host port user passfile remote-path
-	local local_file host port user passfile remote_path target
-	local_file="$1"; host="$2"; port="$3"; user="$4"; passfile="$5"; remote_path="$6"
-	[ -f "$local_file" ] || die "Local input is missing: $local_file"
-	target="$(remote_target "$host" "$user")"
-	sshpass -f "$passfile" scp \
-		-o BatchMode=no \
-		-o ConnectTimeout=12 \
-		-o StrictHostKeyChecking=accept-new \
-		-o UserKnownHostsFile="$KNOWN_HOSTS" \
-		-P "$port" "$local_file" "${target}:${remote_path}"
-}
-
-copy_from_remote() {
-	# host port user passfile remote-path local-file
-	local host port user passfile remote_path local_file target
-	host="$1"; port="$2"; user="$3"; passfile="$4"; remote_path="$5"; local_file="$6"
-	target="$(remote_target "$host" "$user")"
-	if ! sshpass -f "$passfile" scp \
-		-o BatchMode=no \
-		-o ConnectTimeout=12 \
-		-o StrictHostKeyChecking=accept-new \
-		-o UserKnownHostsFile="$KNOWN_HOSTS" \
-		-P "$port" "${target}:${remote_path}" "$local_file"; then
-		rm -f "$local_file"
-		die 'Could not download the remote profile archive.'
-	fi
-	[ -s "$local_file" ] || die 'Remote router created an empty profile archive.'
-}
-'''
-text = text[:start] + replacement + text[end:]
-if 'base64' in text:
-    raise SystemExit('base64 remains in remote coordinator')
-remote.write_text(text, encoding="utf-8")
+path.write_text(text, encoding="utf-8")
 PY
 
 size="$(du -sk "$work/data" | awk '{print $1}')"
@@ -109,6 +62,7 @@ cat > "$work/control/postinst" <<'EOF'
 [ -n "$IPKG_INSTROOT" ] && exit 0
 mkdir -p /root/glinet-crossmodel/profiles /tmp/glinet-crossmodel /root/.ssh
 chmod 700 /root/.ssh
+# Do not restart web services here: LuCI Package Manager uses XHR.
 rm -f /tmp/luci-indexcache
 rm -rf /tmp/luci-modulecache
 exit 0
@@ -116,6 +70,7 @@ EOF
 chmod 0755 "$work/control/postinst"
 printf '2.0\n' > "$work/debian-binary"
 
+# GL.iNet firmware 4.0 / OpenWrt 21.02 uses a gzip-compressed tar wrapper.
 (cd "$work/data" && tar --owner=0 --group=0 --numeric-owner -czf "$work/data.tar.gz" .)
 (cd "$work/control" && tar --owner=0 --group=0 --numeric-owner -czf "$work/control.tar.gz" .)
 ipk="$out/${name}_${version}-${release}_all.ipk"
@@ -123,6 +78,7 @@ rm -f "$ipk" "$ipk.sha256"
 (cd "$work" && tar --owner=0 --group=0 --numeric-owner -czf "$ipk" ./debian-binary ./data.tar.gz ./control.tar.gz)
 sha256sum "$ipk" > "$ipk.sha256"
 
+# Validate the actual package container, control metadata, and legacy SCP fix.
 tar -tzf "$ipk" | grep -qx './debian-binary'
 tar -tzf "$ipk" | grep -qx './data.tar.gz'
 tar -tzf "$ipk" | grep -qx './control.tar.gz'
@@ -130,6 +86,7 @@ tar -xOzf "$ipk" ./debian-binary | grep -qx '2.0'
 tar -xOzf "$ipk" ./control.tar.gz > "$work/control-check.tar.gz"
 tar -xOzf "$work/control-check.tar.gz" ./control | grep -Fq 'Depends: luci-base, openssh-client, sshpass, jsonfilter'
 tar -xOzf "$ipk" ./data.tar.gz > "$work/data-check.tar.gz"
-tar -xOzf "$work/data-check.tar.gz" ./usr/libexec/glinet-crossmodel-remote | grep -Fq 'OpenSSH SCP client is not installed.'
+tar -xOzf "$work/data-check.tar.gz" ./usr/libexec/glinet-crossmodel-remote | grep -Fq 'scp -O'
+tar -xOzf "$work/data-check.tar.gz" ./usr/lib/lua/luci/controller/glinet_crossmodel.lua | grep -Fq 'fs.chmod(PROFILE_DIR, "0700")'
 
 echo "Built $ipk"
