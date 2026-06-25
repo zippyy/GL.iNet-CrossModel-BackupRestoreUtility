@@ -40,6 +40,7 @@ for old, new in {
     'fs.chmod(temporary, 384)': 'fs.chmod(temporary, "0600")',
 }.items():
     text = text.replace(old, new)
+
 old_command = '''local function command(commandline)
 	local pipe = io.popen(commandline .. " 2>&1")
 	local output = pipe:read("*a") or ""
@@ -50,7 +51,8 @@ end
 '''
 new_command = '''local function command(commandline)
 	local marker = "__GCM_EXIT__"
-	local pipe = io.popen("(" .. commandline .. ") 2>&1; rc=$?; printf '\\n" .. marker .. "%s\\n' \"$rc\"")
+	local shell = "(" .. commandline .. ") 2>&1; rc=$?; echo; echo " .. marker .. "$rc"
+	local pipe = io.popen(shell)
 	local output = pipe:read("*a") or ""
 	pipe:close()
 	local status = tonumber(output:match("\\n" .. marker .. "(%d+)%s*$"))
@@ -117,6 +119,7 @@ grep -Fq 'verify_remote_copy' "$work/remote-check.sh"
 grep -Fq 'scp -O' "$work/remote-check.sh"
 tar -xOzf "$work/data-check.tar.gz" ./usr/lib/lua/luci/controller/glinet_crossmodel.lua > "$work/controller-check.lua"
 grep -Fq '__GCM_EXIT__' "$work/controller-check.lua"
+grep -Fq 'local shell = "(" .. commandline .. ") 2>&1; rc=$?; echo; echo " .. marker .. "$rc"' "$work/controller-check.lua"
 grep -Fq 'fs.chmod(PROFILE_DIR, "0700")' "$work/controller-check.lua"
 grep -Fq 'local services = entry({"admin", "services"}, firstchild(), _("Services"), 60)' "$work/controller-check.lua"
 
