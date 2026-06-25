@@ -43,6 +43,13 @@ remote_target() {
 	case "$host" in *:) die 'Invalid remote host.' ;; *:* ) printf '%s@[%s]\n' "$user" "$host" ;; * ) printf '%s@%s\n' "$user" "$host" ;; esac
 }
 
+local_md5() {
+	local file sum
+	file="$1"
+	sum="$(md5sum "$file" 2>/dev/null)" || return 1
+	printf '%s\n' "${sum%% *}"
+}
+
 prepare_connection() {
 	local host port user passfile
 	host="$1"; port="$2"; user="$3"; passfile="$4"
@@ -54,6 +61,7 @@ prepare_connection() {
 	command -v ssh >/dev/null 2>&1 || die 'OpenSSH client is not installed.'
 	command -v scp >/dev/null 2>&1 || die 'OpenSSH SCP client is not installed.'
 	command -v sshpass >/dev/null 2>&1 || die 'sshpass is not installed.'
+	command -v md5sum >/dev/null 2>&1 || die 'md5sum is not available on the control router.'
 	mkdir -p /root/.ssh
 	chmod 700 /root/.ssh
 }
@@ -103,6 +111,18 @@ scp_from_remote() {
 	[ -s "$local_file" ] || die 'Remote router created an empty profile archive.'
 }
 
+verify_remote_copy() {
+	# local-file host port user passfile remote-path
+	local local_file host port user passfile remote_path local_sum remote_sum
+	local_file="$1"; host="$2"; port="$3"; user="$4"; passfile="$5"; remote_path="$6"
+	local_sum="$(local_md5 "$local_file")" || die 'Could not calculate the local profile checksum.'
+	remote_sum="$(ssh_run "$host" "$port" "$user" "$passfile" "md5sum '$remote_path' 2>/dev/null")" || die 'Could not calculate the uploaded profile checksum on the target router.'
+	remote_sum="${remote_sum%% *}"
+	[ -n "$remote_sum" ] || die 'The target router does not provide a checksum for the uploaded profile archive.'
+	[ "$local_sum" = "$remote_sum" ] || die "Profile transfer checksum mismatch (local $local_sum, target $remote_sum)."
+	ssh_run "$host" "$port" "$user" "$passfile" "tar -tzf '$remote_path' >/dev/null 2>&1" || die 'Target router cannot read the transferred profile archive.'
+}
+
 stream_backend() {
 	local host port user passfile
 	host="$1"; port="$2"; user="$3"; passfile="$4"; shift 4
@@ -135,6 +155,7 @@ remote_create() {
 	scp_to_remote "$work/binaries.list" "$host" "$port" "$user" "$passfile" "$remote_binaries"
 	stream_backend "$host" "$port" "$user" "$passfile" create "$remote_archive" "$id" "$categories" "$remote_scripts" "$remote_binaries"
 	scp_from_remote "$host" "$port" "$user" "$passfile" "$remote_archive" "$output"
+	tar -tzf "$output" >/dev/null 2>&1 || die 'Downloaded remote profile archive cannot be read by the control router.'
 	ssh_run "$host" "$port" "$user" "$passfile" rm -f "$remote_archive" "$remote_scripts" "$remote_binaries"
 	trap - EXIT INT TERM
 	rm -rf "$work"
@@ -154,6 +175,7 @@ remote_restore() {
 	remote_archive="/tmp/glinet-crossmodel-restore-${id}.tar.gz"
 	trap 'ssh_run "$host" "$port" "$user" "$passfile" rm -f "$remote_archive" >/dev/null 2>&1 || true' EXIT INT TERM
 	scp_to_remote "$input" "$host" "$port" "$user" "$passfile" "$remote_archive"
+	verify_remote_copy "$input" "$host" "$port" "$user" "$passfile" "$remote_archive"
 	stream_backend "$host" "$port" "$user" "$passfile" restore "$remote_archive" "$categories" "$install_packages" "$direct_files"
 	ssh_run "$host" "$port" "$user" "$passfile" rm -f "$remote_archive"
 	trap - EXIT INT TERM
