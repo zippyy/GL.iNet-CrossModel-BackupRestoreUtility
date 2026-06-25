@@ -124,9 +124,19 @@ verify_remote_copy() {
 }
 
 stream_backend() {
-	local host port user passfile
+	local host port user passfile action
 	host="$1"; port="$2"; user="$3"; passfile="$4"; shift 4
-	cat "$APP" | ssh_run "$host" "$port" "$user" "$passfile" sh -s -- "$@"
+	action="${1:-}"
+	case "$action" in
+		restore)
+			# Keep the remote SSH control channel alive until status is returned.
+			# The target applies firewall/Wi-Fi changes after its next reboot.
+			cat "$APP" | ssh_run "$host" "$port" "$user" "$passfile" env GCM_DEFER_RELOAD=1 sh -s -- "$@"
+			;;
+		*)
+			cat "$APP" | ssh_run "$host" "$port" "$user" "$passfile" sh -s -- "$@"
+			;;
+	esac
 }
 
 facts() {
