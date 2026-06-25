@@ -1,7 +1,6 @@
 #!/bin/sh
 # SSH coordinator for luci-app-glinet-crossmodel-backup.
-# Runs on the router hosting the IPK. It streams the native backend to a
-# remote GL.iNet/OpenWrt router, so the remote device does not need this IPK.
+# Runs on the router hosting the IPK. The remote router only needs SSH/SCP.
 
 set -eu
 PATH='/usr/sbin:/usr/bin:/sbin:/bin'
@@ -33,7 +32,7 @@ valid_categories() {
 		part="${original%%,*}"
 		if [ "$original" = "$part" ]; then original=''; else original="${original#*,}"; fi
 		case "$part" in network|wireless|vpn|firewall|adguard|ddns|system|packages|scripts|binaries) ;; *) return 1 ;; esac
-		case ",$canonical," in *",$part,"*) ;; *) canonical="${canonical:+$canonical,}$part" ;; esac
+		case ",$canonical," in *,"$part,"*) ;; *) canonical="${canonical:+$canonical,}$part" ;; esac
 	done
 	printf '%s\n' "$canonical"
 }
@@ -53,14 +52,13 @@ prepare_connection() {
 	[ -f "$passfile" ] || die 'Temporary SSH credential file is missing.'
 	[ -x "$APP" ] || die 'Native backup backend is missing.'
 	command -v ssh >/dev/null 2>&1 || die 'OpenSSH client is not installed.'
+	command -v scp >/dev/null 2>&1 || die 'OpenSSH SCP client is not installed.'
 	command -v sshpass >/dev/null 2>&1 || die 'sshpass is not installed.'
-	command -v base64 >/dev/null 2>&1 || die 'base64 is not available on the control router.'
 	mkdir -p /root/.ssh
 	chmod 700 /root/.ssh
 }
 
 ssh_run() {
-	# host port user passfile command...
 	local host port user passfile target
 	host="$1"; port="$2"; user="$3"; passfile="$4"; shift 4
 	target="$(remote_target "$host" "$user")"
@@ -74,33 +72,38 @@ ssh_run() {
 		-p "$port" "$target" "$@"
 }
 
-copy_to_remote() {
-	# local-file host port user passfile remote-path
-	local local_file host port user passfile remote_path
+# -O forces classic SCP protocol. GL.iNet/Dropbear targets commonly lack an
+# SFTP subsystem at /usr/libexec/sftp-server, so default modern SCP fails.
+scp_to_remote() {
+	local local_file host port user passfile remote_path target
 	local_file="$1"; host="$2"; port="$3"; user="$4"; passfile="$5"; remote_path="$6"
 	[ -f "$local_file" ] || die "Local input is missing: $local_file"
-	base64 "$local_file" | ssh_run "$host" "$port" "$user" "$passfile" "umask 077; base64 -d > '$remote_path'"
+	target="$(remote_target "$host" "$user")"
+	sshpass -f "$passfile" scp -O \
+		-o BatchMode=no \
+		-o ConnectTimeout=12 \
+		-o StrictHostKeyChecking=accept-new \
+		-o UserKnownHostsFile="$KNOWN_HOSTS" \
+		-P "$port" "$local_file" "${target}:${remote_path}"
 }
 
-copy_from_remote() {
-	# host port user passfile remote-path local-file
-	local host port user passfile remote_path local_file encoded
+scp_from_remote() {
+	local host port user passfile remote_path local_file target
 	host="$1"; port="$2"; user="$3"; passfile="$4"; remote_path="$5"; local_file="$6"
-	encoded="$(mktemp /tmp/glinet-crossmodel-download.XXXXXX)"
-	if ! ssh_run "$host" "$port" "$user" "$passfile" "base64 '$remote_path'" > "$encoded"; then
-		rm -f "$encoded"
+	target="$(remote_target "$host" "$user")"
+	if ! sshpass -f "$passfile" scp -O \
+		-o BatchMode=no \
+		-o ConnectTimeout=12 \
+		-o StrictHostKeyChecking=accept-new \
+		-o UserKnownHostsFile="$KNOWN_HOSTS" \
+		-P "$port" "${target}:${remote_path}" "$local_file"; then
+		rm -f "$local_file"
 		die 'Could not download the remote profile archive.'
 	fi
-	if ! base64 -d "$encoded" > "$local_file"; then
-		rm -f "$encoded" "$local_file"
-		die 'Remote profile archive could not be decoded.'
-	fi
-	rm -f "$encoded"
 	[ -s "$local_file" ] || die 'Remote router created an empty profile archive.'
 }
 
 stream_backend() {
-	# host port user passfile action arguments...
 	local host port user passfile
 	host="$1"; port="$2"; user="$3"; passfile="$4"; shift 4
 	cat "$APP" | ssh_run "$host" "$port" "$user" "$passfile" sh -s -- "$@"
@@ -128,10 +131,10 @@ remote_create() {
 	trap 'rm -rf "$work"; ssh_run "$host" "$port" "$user" "$passfile" rm -f "$remote_archive" "$remote_scripts" "$remote_binaries" >/dev/null 2>&1 || true' EXIT INT TERM
 	cp "$scripts" "$work/scripts.list"
 	cp "$binaries" "$work/binaries.list"
-	copy_to_remote "$work/scripts.list" "$host" "$port" "$user" "$passfile" "$remote_scripts"
-	copy_to_remote "$work/binaries.list" "$host" "$port" "$user" "$passfile" "$remote_binaries"
+	scp_to_remote "$work/scripts.list" "$host" "$port" "$user" "$passfile" "$remote_scripts"
+	scp_to_remote "$work/binaries.list" "$host" "$port" "$user" "$passfile" "$remote_binaries"
 	stream_backend "$host" "$port" "$user" "$passfile" create "$remote_archive" "$id" "$categories" "$remote_scripts" "$remote_binaries"
-	copy_from_remote "$host" "$port" "$user" "$passfile" "$remote_archive" "$output"
+	scp_from_remote "$host" "$port" "$user" "$passfile" "$remote_archive" "$output"
 	ssh_run "$host" "$port" "$user" "$passfile" rm -f "$remote_archive" "$remote_scripts" "$remote_binaries"
 	trap - EXIT INT TERM
 	rm -rf "$work"
@@ -150,7 +153,7 @@ remote_restore() {
 	prepare_connection "$host" "$port" "$user" "$passfile"
 	remote_archive="/tmp/glinet-crossmodel-restore-${id}.tar.gz"
 	trap 'ssh_run "$host" "$port" "$user" "$passfile" rm -f "$remote_archive" >/dev/null 2>&1 || true' EXIT INT TERM
-	copy_to_remote "$input" "$host" "$port" "$user" "$passfile" "$remote_archive"
+	scp_to_remote "$input" "$host" "$port" "$user" "$passfile" "$remote_archive"
 	stream_backend "$host" "$port" "$user" "$passfile" restore "$remote_archive" "$categories" "$install_packages" "$direct_files"
 	ssh_run "$host" "$port" "$user" "$passfile" rm -f "$remote_archive"
 	trap - EXIT INT TERM
