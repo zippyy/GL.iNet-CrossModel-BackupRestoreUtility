@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-glinet-crossmodel-backup
 PKG_VERSION:=1.1.0
-PKG_RELEASE:=9
+PKG_RELEASE:=10
 PKG_LICENSE:=MIT
 PKGARCH:=all
 
@@ -13,7 +13,7 @@ define Package/$(PKG_NAME)
   CATEGORY:=LuCI
   SUBMENU:=3. Applications
   TITLE:=GL.iNet Cross-Model Backup / Restore
-  DEPENDS:=+luci-base
+  DEPENDS:=+luci-base +openssh-client +sshpass +jsonfilter
 endef
 
 define Package/$(PKG_NAME)/description
@@ -36,5 +36,3 @@ define Package/$(PKG_NAME)/install
 endef
 
 $(eval $(call BuildPackage,$(PKG_NAME)))
-
-# Force v1.1.0-9 build and release.
