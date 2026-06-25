@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-glinet-crossmodel-backup
 PKG_VERSION:=1.1.0
-PKG_RELEASE:=15
+PKG_RELEASE:=16
 PKG_LICENSE:=MIT
 PKGARCH:=all
 
