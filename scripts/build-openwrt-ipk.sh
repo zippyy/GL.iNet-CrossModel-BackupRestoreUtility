@@ -21,8 +21,8 @@ cp -a "$payload/." "$work/data/"
 chmod 0755 "$work/data/usr/libexec/glinet-crossmodel-backup"
 chmod 0755 "$work/data/usr/libexec/glinet-crossmodel-remote"
 
-# GL.iNet LuCI expects string chmod modes. Add the parent menu without using
-# an alias, because aliases intercept the nested /api routes used by the app.
+# GL.iNet LuCI expects string chmod modes. Add a real Services parent without
+# using an alias, because aliases intercept the nested API routes used by the app.
 python3 - "$work/data/usr/lib/lua/luci/controller/glinet_crossmodel.lua" <<'PY'
 from pathlib import Path
 import sys
@@ -78,15 +78,21 @@ rm -f "$ipk" "$ipk.sha256"
 (cd "$work" && tar --owner=0 --group=0 --numeric-owner -czf "$ipk" ./debian-binary ./data.tar.gz ./control.tar.gz)
 sha256sum "$ipk" > "$ipk.sha256"
 
-# Validate the actual package container, control metadata, and legacy SCP fix.
+# Validate without piping tar into grep. With pipefail, grep -q exits early
+# and can make tar fail with a false Broken pipe error.
 tar -tzf "$ipk" | grep -qx './debian-binary'
 tar -tzf "$ipk" | grep -qx './data.tar.gz'
 tar -tzf "$ipk" | grep -qx './control.tar.gz'
-tar -xOzf "$ipk" ./debian-binary | grep -qx '2.0'
+tar -xOzf "$ipk" ./debian-binary > "$work/debian-binary-check"
+grep -qx '2.0' "$work/debian-binary-check"
 tar -xOzf "$ipk" ./control.tar.gz > "$work/control-check.tar.gz"
-tar -xOzf "$work/control-check.tar.gz" ./control | grep -Fq 'Depends: luci-base, openssh-client, sshpass, jsonfilter'
+tar -xOzf "$work/control-check.tar.gz" ./control > "$work/control-check"
+grep -Fq 'Depends: luci-base, openssh-client, sshpass, jsonfilter' "$work/control-check"
 tar -xOzf "$ipk" ./data.tar.gz > "$work/data-check.tar.gz"
-tar -xOzf "$work/data-check.tar.gz" ./usr/libexec/glinet-crossmodel-remote | grep -Fq 'scp -O'
-tar -xOzf "$work/data-check.tar.gz" ./usr/lib/lua/luci/controller/glinet_crossmodel.lua | grep -Fq 'fs.chmod(PROFILE_DIR, "0700")'
+tar -xOzf "$work/data-check.tar.gz" ./usr/libexec/glinet-crossmodel-remote > "$work/remote-check.sh"
+grep -Fq 'scp -O' "$work/remote-check.sh"
+tar -xOzf "$work/data-check.tar.gz" ./usr/lib/lua/luci/controller/glinet_crossmodel.lua > "$work/controller-check.lua"
+grep -Fq 'fs.chmod(PROFILE_DIR, "0700")' "$work/controller-check.lua"
+grep -Fq 'local services = entry({"admin", "services"}, firstchild(), _("Services"), 60)' "$work/controller-check.lua"
 
 echo "Built $ipk"
