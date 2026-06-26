@@ -1,0 +1,8 @@
+Package: luci-app-glinet-crossmodel-backup-glui
+Version: 1.1.0-21
+Architecture: all
+Maintainer: Nick Bennett
+Depends: luci-app-glinet-crossmodel-backup
+Description: GL.iNet Admin Panel v4 integration for Cross-Model Backup
+ Adds a System-menu shortcut and header shortcut in the GL.iNet Admin Panel v4
+ for the existing LuCI Cross-Model Backup / Restore utility.
