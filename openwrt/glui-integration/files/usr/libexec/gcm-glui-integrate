@@ -1,0 +1,58 @@
+#!/bin/sh
+# Integrates the Cross-Model LuCI app with GL.iNet Admin Panel v4.
+
+set -u
+
+VERSION='1.1.0-21'
+GL_HOME='/www/gl_home.html'
+HOOK='/www/js/gcm-glui-hook.js'
+CONTROLLER='/usr/lib/lua/luci/controller/glinet_crossmodel.lua'
+VIEW='/usr/lib/lua/luci/view/glinet_crossmodel/index.htm'
+
+clear_luci_cache() {
+    rm -f /tmp/luci-indexcache
+    rm -rf /tmp/luci-modulecache
+}
+
+patch_luci_route() {
+    for file in "$CONTROLLER" "$VIEW"; do
+        [ -f "$file" ] || continue
+        sed -i 's#admin/services/glinet-crossmodel#admin/system/glinet-crossmodel#g' "$file"
+    done
+}
+
+remove_glui_hook() {
+    [ -f "$GL_HOME" ] || return 0
+
+    # gl_home.html is minified on GL.iNet firmware; remove only our exact script tag.
+    sed -i 's#<script src="/js/gcm-glui-hook.js[^"]*"></script>##g' "$GL_HOME"
+    rm -f "$HOOK"
+    clear_luci_cache
+}
+
+install_glui_hook() {
+    [ -f "$GL_HOME" ] || return 0
+    [ -f "$HOOK" ] || return 1
+
+    if ! grep -qF '/js/gcm-glui-hook.js' "$GL_HOME"; then
+        temp="/tmp/gcm-glui-home.$$"
+        sed "s#</body>#<script src=\"/js/gcm-glui-hook.js?v=${VERSION}\"></script></body>#" "$GL_HOME" > "$temp" || {
+            rm -f "$temp"
+            return 1
+        }
+        cat "$temp" > "$GL_HOME"
+        rm -f "$temp"
+    fi
+}
+
+case "${1:-}" in
+    --remove)
+        remove_glui_hook
+        exit 0
+        ;;
+esac
+
+patch_luci_route
+install_glui_hook
+clear_luci_cache
+exit 0
