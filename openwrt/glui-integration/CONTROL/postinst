@@ -1,0 +1,12 @@
+#!/bin/sh
+
+[ -n "$IPKG_INSTROOT" ] && exit 0
+
+/usr/libexec/gcm-glui-integrate || true
+/etc/init.d/gcm-glui-integration enable || true
+/etc/init.d/gcm-glui-integration start || true
+
+rm -f /tmp/luci-indexcache
+rm -rf /tmp/luci-modulecache
+
+exit 0
