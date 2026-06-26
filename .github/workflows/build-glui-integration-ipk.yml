@@ -1,0 +1,22 @@
+name: Build GL.iNet Admin Panel integration IPK
+
+on:
+  push:
+    paths:
+      - 'openwrt/glui-integration/**'
+      - '.github/workflows/build-glui-integration-ipk.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build legacy GL.iNet IPK
+        run: sh openwrt/glui-integration/build-ipk.sh
+      - name: Upload IPK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: luci-app-glinet-crossmodel-backup-glui_1.1.0-21_all
+          path: dist/luci-app-glinet-crossmodel-backup-glui_1.1.0-21_all.ipk
+          if-no-files-found: error
