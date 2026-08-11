@@ -6,6 +6,7 @@ on:
     branches: [OpenWRT]
     paths:
       - 'openwrt/**'
+      - 'tests/**'
       - 'scripts/build-openwrt-ipk.sh'
       - '.github/workflows/build-openwrt-ipk.yml'
 
@@ -17,6 +18,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Static and security tests
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y lua5.1 shellcheck
+          sh tests/run.sh
+          luac5.1 -p openwrt/luci-app-glinet-crossmodel-backup/root/usr/lib/lua/luci/controller/glinet_crossmodel.lua
+          node tests/test-view-js.cjs
+          shellcheck --severity=warning \
+            openwrt/luci-app-glinet-crossmodel-backup/root/usr/bin/glinet-crossmodel \
+            openwrt/luci-app-glinet-crossmodel-backup/root/usr/lib/glinet-crossmodel/core.sh \
+            openwrt/luci-app-glinet-crossmodel-backup/root/usr/libexec/glinet-crossmodel-remote \
+            openwrt/luci-app-glinet-crossmodel-backup/root/usr/libexec/glinet-crossmodel-backup \
+            openwrt/luci-app-glinet-crossmodel-backup/root/usr/libexec/glinet-crossmodel-validate \
+            openwrt/luci-app-glinet-crossmodel-backup/root/usr/libexec/gcm-glui-integrate \
+            openwrt/luci-app-glinet-crossmodel-backup/root/etc/init.d/gcm-glui-integration \
+            scripts/real-router-smoke.sh
 
       - name: Build package
         run: |

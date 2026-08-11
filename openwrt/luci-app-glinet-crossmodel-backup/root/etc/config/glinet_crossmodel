@@ -1,0 +1,5 @@
+config storage 'storage'
+	option max_profiles '20'
+	option max_storage_mb '128'
+	option auto_prune '0'
+	option max_rollbacks '5'

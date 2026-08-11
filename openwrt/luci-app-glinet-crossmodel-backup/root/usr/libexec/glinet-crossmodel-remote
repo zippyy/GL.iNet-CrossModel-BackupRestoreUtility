@@ -1,20 +1,36 @@
 #!/bin/sh
-# SSH coordinator for luci-app-glinet-crossmodel-backup.
-# Runs on the router hosting the IPK. The remote router only needs SSH/SCP.
+# Agentless SSH coordinator. The same IPK is installed only on the controller;
+# core.sh and the CLI are concatenated and streamed to each remote endpoint.
 
 set -eu
-PATH='/usr/sbin:/usr/bin:/sbin:/bin'
-APP='/usr/libexec/glinet-crossmodel-backup'
-KNOWN_HOSTS='/root/.ssh/known_hosts'
+PATH=${GCM_PATH:-/usr/sbin:/usr/bin:/sbin:/bin}
+CORE=${GCM_CORE:-/usr/lib/glinet-crossmodel/core.sh}
+CLI=${GCM_CLI:-/usr/bin/glinet-crossmodel}
+KNOWN_HOSTS=${GCM_KNOWN_HOSTS:-/root/.ssh/known_hosts}
+CLEANUP_ACTIVE=0
+CLEANUP_HOST=''
+CLEANUP_PORT=''
+CLEANUP_USER=''
+CLEANUP_AUTH=''
+CLEANUP_CREDENTIAL=''
+CLEANUP_PATHS=''
 
 log() { printf '%s\n' "$*"; }
 die() { log "ERROR: $*" >&2; exit 1; }
+shell_quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\"'\\\"'/g")"; }
+
 usage() {
 	cat >&2 <<'EOF'
 Usage:
-  glinet-crossmodel-remote facts <host> <port> <user> <password-file>
-  glinet-crossmodel-remote create <local-output.tar.gz> <profile-id> <categories-csv> <scripts-list> <binaries-list> <host> <port> <user> <password-file>
-  glinet-crossmodel-remote restore <local-input.tar.gz> <profile-id> <categories-csv> <install-packages:0|1> <direct-files:0|1> <host> <port> <user> <password-file>
+  glinet-crossmodel-remote facts HOST PORT USER AUTH CREDENTIAL
+  glinet-crossmodel-remote create OUTPUT STRATEGY UUID NAME NOTES CATEGORIES SCRIPTS BINARIES HOST PORT USER AUTH CREDENTIAL
+  glinet-crossmodel-remote validate ARCHIVE UUID CATEGORIES OVERRIDE HOST PORT USER AUTH CREDENTIAL
+  glinet-crossmodel-remote restore ARCHIVE UUID CATEGORIES PACKAGES DIRECT OVERRIDE ALLOW_LEGACY HOST PORT USER AUTH CREDENTIAL
+  glinet-crossmodel-remote packages ARCHIVE UUID HOST PORT USER AUTH CREDENTIAL
+
+AUTH is password, key, or agent. CREDENTIAL is a mode-0600 password file, a
+private-key path, or '-' for agent authentication. Passwords are never accepted
+as command-line values.
 EOF
 	exit 2
 }
@@ -22,179 +38,217 @@ EOF
 valid_host() { case "$1" in ''|*[!A-Za-z0-9._:-]*) return 1 ;; *) return 0 ;; esac; }
 valid_port() { case "$1" in ''|*[!0-9]*) return 1 ;; esac; [ "$1" -ge 1 ] 2>/dev/null && [ "$1" -le 65535 ] 2>/dev/null; }
 valid_user() { case "$1" in ''|*[!A-Za-z0-9._-]*) return 1 ;; *) return 0 ;; esac; }
-valid_id() { case "$1" in *[!a-f0-9-]*|'') return 1 ;; *) return 0 ;; esac; }
-
-valid_categories() {
-	local original part canonical
-	original="$1"; canonical=''
-	[ -n "$original" ] || return 1
-	while [ -n "$original" ]; do
-		part="${original%%,*}"
-		if [ "$original" = "$part" ]; then original=''; else original="${original#*,}"; fi
-		case "$part" in network|wireless|vpn|firewall|adguard|ddns|system|packages|scripts|binaries) ;; *) return 1 ;; esac
-		case ",$canonical," in *,"$part,"*) ;; *) canonical="${canonical:+$canonical,}$part" ;; esac
-	done
-	printf '%s\n' "$canonical"
-}
+valid_id() { case "$1" in ''|*[!A-Fa-f0-9-]*) return 1 ;; *) return 0 ;; esac; }
 
 remote_target() {
-	local host user
-	host="$1"; user="$2"
-	case "$host" in *:) die 'Invalid remote host.' ;; *:* ) printf '%s@[%s]\n' "$user" "$host" ;; * ) printf '%s@%s\n' "$user" "$host" ;; esac
-}
-
-local_md5() {
-	local file sum
-	file="$1"
-	sum="$(md5sum "$file" 2>/dev/null)" || return 1
-	printf '%s\n' "${sum%% *}"
+	host=$1; user=$2
+	case "$host" in *:) die 'Invalid remote host.' ;; *:*) printf '%s@[%s]\n' "$user" "$host" ;; *) printf '%s@%s\n' "$user" "$host" ;; esac
 }
 
 prepare_connection() {
-	local host port user passfile
-	host="$1"; port="$2"; user="$3"; passfile="$4"
+	host=$1; port=$2; user=$3; auth=$4; credential=$5
 	valid_host "$host" || die 'Remote host contains invalid characters.'
 	valid_port "$port" || die 'Remote SSH port must be 1 through 65535.'
 	valid_user "$user" || die 'Remote SSH username contains invalid characters.'
-	[ -f "$passfile" ] || die 'Temporary SSH credential file is missing.'
-	[ -x "$APP" ] || die 'Native backup backend is missing.'
+	[ -r "$CORE" ] && [ -r "$CLI" ] || die 'Streamed runtime files are missing.'
 	command -v ssh >/dev/null 2>&1 || die 'OpenSSH client is not installed.'
 	command -v scp >/dev/null 2>&1 || die 'OpenSSH SCP client is not installed.'
-	command -v sshpass >/dev/null 2>&1 || die 'sshpass is not installed.'
-	command -v md5sum >/dev/null 2>&1 || die 'md5sum is not available on the control router.'
-	mkdir -p /root/.ssh
-	chmod 700 /root/.ssh
+	command -v sha256sum >/dev/null 2>&1 || die 'sha256sum is not available on the controller.'
+	case "$auth" in
+		password) [ -f "$credential" ] || die 'Temporary SSH password file is missing.'; command -v sshpass >/dev/null 2>&1 || die 'sshpass is not installed.' ;;
+		key) [ -f "$credential" ] || die 'SSH private-key file is missing.' ;;
+		agent) [ "$credential" = - ] || die 'Agent authentication credential must be -.' ;;
+		*) die 'SSH authentication must be password, key, or agent.' ;;
+	esac
+	known_hosts_dir=${KNOWN_HOSTS%/*}
+	[ "$known_hosts_dir" != "$KNOWN_HOSTS" ] || known_hosts_dir='.'
+	mkdir -p "$known_hosts_dir"
+	chmod 700 "$known_hosts_dir"
+	touch "$KNOWN_HOSTS"
+	chmod 600 "$KNOWN_HOSTS"
 }
 
 ssh_run() {
-	local host port user passfile target
-	host="$1"; port="$2"; user="$3"; passfile="$4"; shift 4
-	target="$(remote_target "$host" "$user")"
-	sshpass -f "$passfile" ssh \
-		-o BatchMode=no \
-		-o ConnectTimeout=12 \
-		-o ServerAliveInterval=5 \
-		-o ServerAliveCountMax=2 \
-		-o StrictHostKeyChecking=accept-new \
-		-o UserKnownHostsFile="$KNOWN_HOSTS" \
-		-p "$port" "$target" "$@"
-}
-
-# -O forces classic SCP protocol. GL.iNet/Dropbear targets commonly lack an
-# SFTP subsystem at /usr/libexec/sftp-server, so default modern SCP fails.
-scp_to_remote() {
-	local local_file host port user passfile remote_path target
-	local_file="$1"; host="$2"; port="$3"; user="$4"; passfile="$5"; remote_path="$6"
-	[ -f "$local_file" ] || die "Local input is missing: $local_file"
-	target="$(remote_target "$host" "$user")"
-	sshpass -f "$passfile" scp -O \
-		-o BatchMode=no \
-		-o ConnectTimeout=12 \
-		-o StrictHostKeyChecking=accept-new \
-		-o UserKnownHostsFile="$KNOWN_HOSTS" \
-		-P "$port" "$local_file" "${target}:${remote_path}"
-}
-
-scp_from_remote() {
-	local host port user passfile remote_path local_file target
-	host="$1"; port="$2"; user="$3"; passfile="$4"; remote_path="$5"; local_file="$6"
-	target="$(remote_target "$host" "$user")"
-	if ! sshpass -f "$passfile" scp -O \
-		-o BatchMode=no \
-		-o ConnectTimeout=12 \
-		-o StrictHostKeyChecking=accept-new \
-		-o UserKnownHostsFile="$KNOWN_HOSTS" \
-		-P "$port" "${target}:${remote_path}" "$local_file"; then
-		rm -f "$local_file"
-		die 'Could not download the remote profile archive.'
-	fi
-	[ -s "$local_file" ] || die 'Remote router created an empty profile archive.'
-}
-
-verify_remote_copy() {
-	# local-file host port user passfile remote-path
-	local local_file host port user passfile remote_path local_sum remote_sum
-	local_file="$1"; host="$2"; port="$3"; user="$4"; passfile="$5"; remote_path="$6"
-	local_sum="$(local_md5 "$local_file")" || die 'Could not calculate the local profile checksum.'
-	remote_sum="$(ssh_run "$host" "$port" "$user" "$passfile" "md5sum '$remote_path' 2>/dev/null")" || die 'Could not calculate the uploaded profile checksum on the target router.'
-	remote_sum="${remote_sum%% *}"
-	[ -n "$remote_sum" ] || die 'The target router does not provide a checksum for the uploaded profile archive.'
-	[ "$local_sum" = "$remote_sum" ] || die "Profile transfer checksum mismatch (local $local_sum, target $remote_sum)."
-	ssh_run "$host" "$port" "$user" "$passfile" "tar -tzf '$remote_path' >/dev/null 2>&1" || die 'Target router cannot read the transferred profile archive.'
-}
-
-stream_backend() {
-	local host port user passfile action
-	host="$1"; port="$2"; user="$3"; passfile="$4"; shift 4
-	action="${1:-}"
-	case "$action" in
-		restore)
-			# Keep the remote SSH control channel alive until status is returned.
-			# The target applies firewall/Wi-Fi changes after its next reboot.
-			cat "$APP" | ssh_run "$host" "$port" "$user" "$passfile" env GCM_DEFER_RELOAD=1 sh -s -- "$@"
+	host=$1; port=$2; user=$3; auth=$4; credential=$5; shift 5
+	target=$(remote_target "$host" "$user")
+	case "$auth" in
+		password)
+			sshpass -f "$credential" ssh -o BatchMode=no -o PasswordAuthentication=yes \
+				-o ConnectTimeout=12 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 \
+				-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$KNOWN_HOSTS" \
+				-p "$port" "$target" "$@"
 			;;
-		*)
-			cat "$APP" | ssh_run "$host" "$port" "$user" "$passfile" sh -s -- "$@"
+		key)
+			ssh -i "$credential" -o IdentitiesOnly=yes -o BatchMode=yes \
+				-o ConnectTimeout=12 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 \
+				-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$KNOWN_HOSTS" \
+				-p "$port" "$target" "$@"
+			;;
+		agent)
+			ssh -o BatchMode=yes -o ConnectTimeout=12 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 \
+				-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$KNOWN_HOSTS" \
+				-p "$port" "$target" "$@"
 			;;
 	esac
 }
 
-facts() {
-	[ "$#" -eq 4 ] || usage
-	prepare_connection "$1" "$2" "$3" "$4"
-	stream_backend "$1" "$2" "$3" "$4" facts
+scp_to_remote() {
+	local_file=$1; host=$2; port=$3; user=$4; auth=$5; credential=$6; remote_path=$7
+	[ -f "$local_file" ] || die "Local input is missing: $local_file"
+	target=$(remote_target "$host" "$user")
+	case "$auth" in
+		password) sshpass -f "$credential" scp -O -o BatchMode=no -o PasswordAuthentication=yes -o ConnectTimeout=12 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$KNOWN_HOSTS" -P "$port" "$local_file" "${target}:${remote_path}" ;;
+		key) scp -O -i "$credential" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=12 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$KNOWN_HOSTS" -P "$port" "$local_file" "${target}:${remote_path}" ;;
+		agent) scp -O -o BatchMode=yes -o ConnectTimeout=12 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$KNOWN_HOSTS" -P "$port" "$local_file" "${target}:${remote_path}" ;;
+	esac
+}
+
+scp_from_remote() {
+	host=$1; port=$2; user=$3; auth=$4; credential=$5; remote_path=$6; local_file=$7
+	target=$(remote_target "$host" "$user")
+	case "$auth" in
+		password) sshpass -f "$credential" scp -O -o BatchMode=no -o PasswordAuthentication=yes -o ConnectTimeout=12 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$KNOWN_HOSTS" -P "$port" "${target}:${remote_path}" "$local_file" ;;
+		key) scp -O -i "$credential" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=12 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$KNOWN_HOSTS" -P "$port" "${target}:${remote_path}" "$local_file" ;;
+		agent) scp -O -o BatchMode=yes -o ConnectTimeout=12 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$KNOWN_HOSTS" -P "$port" "${target}:${remote_path}" "$local_file" ;;
+	esac || { rm -f "$local_file"; die 'Could not download the remote archive.'; }
+	[ -s "$local_file" ] || die 'Remote router returned an empty archive.'
+}
+
+stream_cli() {
+	host=$1; port=$2; user=$3; auth=$4; credential=$5; shift 5
+	if [ "${GCM_DEFER_RELOAD:-0}" = 1 ]; then remote_command='env GCM_DEFER_RELOAD=1 sh -s --'; else remote_command='sh -s --'; fi
+	for argument in "$@"; do remote_command="$remote_command $(shell_quote "$argument")"; done
+	{ cat "$CORE"; printf '\n'; cat "$CLI"; } | ssh_run "$host" "$port" "$user" "$auth" "$credential" "$remote_command"
+}
+
+local_sha256() { sha256sum "$1" | awk '{print $1}'; }
+
+verify_remote_copy() {
+	local_file=$1; host=$2; port=$3; user=$4; auth=$5; credential=$6; remote_path=$7
+	local_sum=$(local_sha256 "$local_file")
+	remote_output=$(ssh_run "$host" "$port" "$user" "$auth" "$credential" "sha256sum $(shell_quote "$remote_path") 2>/dev/null") || die 'Could not calculate SHA-256 on the remote router.'
+	remote_sum=${remote_output%% *}
+	[ "$local_sum" = "$remote_sum" ] || die "Remote transfer SHA-256 mismatch (local $local_sum, remote ${remote_sum:-missing})."
+	ssh_run "$host" "$port" "$user" "$auth" "$credential" "tar -tzf $(shell_quote "$remote_path") >/dev/null 2>&1" || die 'Remote router cannot read the transferred archive.'
+}
+
+cleanup_remote() {
+	host=$1; port=$2; user=$3; auth=$4; credential=$5; shift 5
+	command='rm -f'
+	for path in "$@"; do command="$command $(shell_quote "$path")"; done
+	ssh_run "$host" "$port" "$user" "$auth" "$credential" "$command" >/dev/null 2>&1 || true
+}
+
+track_cleanup() {
+	CLEANUP_HOST=$1; CLEANUP_PORT=$2; CLEANUP_USER=$3; CLEANUP_AUTH=$4; CLEANUP_CREDENTIAL=$5; shift 5
+	CLEANUP_PATHS=$*
+	CLEANUP_ACTIVE=1
+}
+
+clear_cleanup() { CLEANUP_ACTIVE=0; CLEANUP_PATHS=''; }
+
+cleanup_tracked() {
+	status=$?
+	if [ "$CLEANUP_ACTIVE" = 1 ]; then
+		CLEANUP_ACTIVE=0
+		# Tracked remote paths are generated safe /tmp names without spaces.
+		cleanup_remote "$CLEANUP_HOST" "$CLEANUP_PORT" "$CLEANUP_USER" "$CLEANUP_AUTH" "$CLEANUP_CREDENTIAL" $CLEANUP_PATHS
+	fi
+	trap - EXIT HUP INT TERM
+	[ "$status" -eq 0 ] || exit "$status"
+}
+
+trap cleanup_tracked EXIT HUP INT TERM
+
+remote_facts() {
+	[ "$#" -eq 5 ] || usage
+	prepare_connection "$@"
+	stream_cli "$@" facts
 }
 
 remote_create() {
-	[ "$#" -eq 9 ] || usage
-	local output id categories scripts binaries host port user passfile remote_base remote_archive remote_scripts remote_binaries work
-	output="$1"; id="$2"; categories="$(valid_categories "$3")" || die 'Invalid backup categories.'; scripts="$4"; binaries="$5"; host="$6"; port="$7"; user="$8"; passfile="$9"
-	valid_id "$id" || die 'Invalid profile ID.'
-	[ -f "$scripts" ] || die 'Custom scripts list is missing.'
-	[ -f "$binaries" ] || die 'Custom binaries list is missing.'
-	prepare_connection "$host" "$port" "$user" "$passfile"
-	work="$(mktemp -d /tmp/glinet-crossmodel-remote.XXXXXX)"
-	remote_base="/tmp/glinet-crossmodel-${id}"
-	remote_archive="${remote_base}.tar.gz"
-	remote_scripts="${remote_base}-scripts.list"
-	remote_binaries="${remote_base}-binaries.list"
-	trap 'rm -rf "$work"; ssh_run "$host" "$port" "$user" "$passfile" rm -f "$remote_archive" "$remote_scripts" "$remote_binaries" >/dev/null 2>&1 || true' EXIT INT TERM
-	cp "$scripts" "$work/scripts.list"
-	cp "$binaries" "$work/binaries.list"
-	scp_to_remote "$work/scripts.list" "$host" "$port" "$user" "$passfile" "$remote_scripts"
-	scp_to_remote "$work/binaries.list" "$host" "$port" "$user" "$passfile" "$remote_binaries"
-	stream_backend "$host" "$port" "$user" "$passfile" create "$remote_archive" "$id" "$categories" "$remote_scripts" "$remote_binaries"
-	scp_from_remote "$host" "$port" "$user" "$passfile" "$remote_archive" "$output"
-	tar -tzf "$output" >/dev/null 2>&1 || die 'Downloaded remote profile archive cannot be read by the control router.'
-	ssh_run "$host" "$port" "$user" "$passfile" rm -f "$remote_archive" "$remote_scripts" "$remote_binaries"
-	trap - EXIT INT TERM
-	rm -rf "$work"
+	[ "$#" -eq 13 ] || usage
+	output=$1; strategy=$2; id=$3; name=$4; notes=$5; categories=$6; scripts=$7; binaries=$8; host=$9
+	shift 9; port=$1; user=$2; auth=$3; credential=$4
+	valid_id "$id" || die 'Invalid profile UUID.'
+	prepare_connection "$host" "$port" "$user" "$auth" "$credential"
+	remote_base="/tmp/gcm-$id"
+	remote_archive="$remote_base.tar.gz"; remote_scripts="$remote_base-scripts"; remote_binaries="$remote_base-binaries"
+	track_cleanup "$host" "$port" "$user" "$auth" "$credential" "$remote_archive" "$remote_scripts" "$remote_binaries"
+	scp_to_remote "$scripts" "$host" "$port" "$user" "$auth" "$credential" "$remote_scripts"
+	scp_to_remote "$binaries" "$host" "$port" "$user" "$auth" "$credential" "$remote_binaries"
+	if ! stream_cli "$host" "$port" "$user" "$auth" "$credential" create --output "$remote_archive" --strategy "$strategy" --id "$id" --name "$name" --notes "$notes" --categories "$categories" --scripts-list "$remote_scripts" --binaries-list "$remote_binaries"; then
+		cleanup_remote "$host" "$port" "$user" "$auth" "$credential" "$remote_archive" "$remote_scripts" "$remote_binaries"; exit 1
+	fi
+	scp_from_remote "$host" "$port" "$user" "$auth" "$credential" "$remote_archive" "$output"
+	verify_remote_copy "$output" "$host" "$port" "$user" "$auth" "$credential" "$remote_archive"
+	cleanup_remote "$host" "$port" "$user" "$auth" "$credential" "$remote_archive" "$remote_scripts" "$remote_binaries"
+	clear_cleanup
 	log "CREATED=$output"
 	log "REMOTE_SOURCE=$host"
 }
 
-remote_restore() {
+remote_validate() {
 	[ "$#" -eq 9 ] || usage
-	local input id categories install_packages direct_files host port user passfile remote_archive
-	input="$1"; id="$2"; categories="$(valid_categories "$3")" || die 'Invalid restore categories.'; install_packages="$4"; direct_files="$5"; host="$6"; port="$7"; user="$8"; passfile="$9"
-	valid_id "$id" || die 'Invalid profile ID.'
-	[ -f "$input" ] || die 'Portable profile archive is missing.'
-	case "$install_packages" in 0|1) ;; *) die 'Invalid package install option.' ;; esac
-	case "$direct_files" in 0|1) ;; *) die 'Invalid direct file restore option.' ;; esac
-	prepare_connection "$host" "$port" "$user" "$passfile"
-	remote_archive="/tmp/glinet-crossmodel-restore-${id}.tar.gz"
-	trap 'ssh_run "$host" "$port" "$user" "$passfile" rm -f "$remote_archive" >/dev/null 2>&1 || true' EXIT INT TERM
-	scp_to_remote "$input" "$host" "$port" "$user" "$passfile" "$remote_archive"
-	verify_remote_copy "$input" "$host" "$port" "$user" "$passfile" "$remote_archive"
-	stream_backend "$host" "$port" "$user" "$passfile" restore "$remote_archive" "$categories" "$install_packages" "$direct_files"
-	ssh_run "$host" "$port" "$user" "$passfile" rm -f "$remote_archive"
-	trap - EXIT INT TERM
+	archive=$1; id=$2; categories=$3; override=$4; host=$5; port=$6; user=$7; auth=$8; credential=$9
+	valid_id "$id" || die 'Invalid operation UUID.'
+	prepare_connection "$host" "$port" "$user" "$auth" "$credential"
+	remote_archive="/tmp/gcm-validate-$id.tar.gz"
+	track_cleanup "$host" "$port" "$user" "$auth" "$credential" "$remote_archive"
+	scp_to_remote "$archive" "$host" "$port" "$user" "$auth" "$credential" "$remote_archive"
+	verify_remote_copy "$archive" "$host" "$port" "$user" "$auth" "$credential" "$remote_archive"
+	if [ "$override" = 1 ]; then
+		if stream_cli "$host" "$port" "$user" "$auth" "$credential" validate "$remote_archive" --categories "$categories" --dangerous-device-override; then status=0; else status=$?; fi
+	else
+		if stream_cli "$host" "$port" "$user" "$auth" "$credential" validate "$remote_archive" --categories "$categories"; then status=0; else status=$?; fi
+	fi
+	cleanup_remote "$host" "$port" "$user" "$auth" "$credential" "$remote_archive"
+	clear_cleanup
+	return "$status"
+}
+
+remote_restore() {
+	[ "$#" -eq 12 ] || usage
+	archive=$1; id=$2; categories=$3; packages=$4; direct=$5; override=$6; allow_legacy=$7; host=$8; port=$9
+	shift 9; user=$1; auth=$2; credential=$3
+	valid_id "$id" || die 'Invalid operation UUID.'
+	prepare_connection "$host" "$port" "$user" "$auth" "$credential"
+	remote_archive="/tmp/gcm-restore-$id.tar.gz"
+	track_cleanup "$host" "$port" "$user" "$auth" "$credential" "$remote_archive"
+	scp_to_remote "$archive" "$host" "$port" "$user" "$auth" "$credential" "$remote_archive"
+	verify_remote_copy "$archive" "$host" "$port" "$user" "$auth" "$credential" "$remote_archive"
+	set -- restore "$remote_archive" --categories "$categories"
+	[ -n "$packages" ] && set -- "$@" --packages "$packages"
+	[ "$direct" = 1 ] && set -- "$@" --direct-custom-files
+	[ "$override" = 1 ] && set -- "$@" --dangerous-device-override
+	[ "$allow_legacy" = 1 ] && set -- "$@" --allow-legacy
+	if ! GCM_DEFER_RELOAD=1 stream_cli "$host" "$port" "$user" "$auth" "$credential" "$@"; then
+		cleanup_remote "$host" "$port" "$user" "$auth" "$credential" "$remote_archive"; exit 1
+	fi
+	cleanup_remote "$host" "$port" "$user" "$auth" "$credential" "$remote_archive"
+	clear_cleanup
 	log "REMOTE_TARGET=$host"
 }
 
+remote_packages() {
+	[ "$#" -eq 7 ] || usage
+	archive=$1; id=$2; host=$3; port=$4; user=$5; auth=$6; credential=$7
+	prepare_connection "$host" "$port" "$user" "$auth" "$credential"
+	remote_archive="/tmp/gcm-packages-$id.tar.gz"
+	track_cleanup "$host" "$port" "$user" "$auth" "$credential" "$remote_archive"
+	scp_to_remote "$archive" "$host" "$port" "$user" "$auth" "$credential" "$remote_archive"
+	verify_remote_copy "$archive" "$host" "$port" "$user" "$auth" "$credential" "$remote_archive"
+	if stream_cli "$host" "$port" "$user" "$auth" "$credential" packages "$remote_archive"; then status=0; else status=$?; fi
+	cleanup_remote "$host" "$port" "$user" "$auth" "$credential" "$remote_archive"
+	clear_cleanup
+	return "$status"
+}
+
 case "${1:-}" in
-	facts) shift; facts "$@" ;;
+	facts) shift; remote_facts "$@" ;;
 	create) shift; remote_create "$@" ;;
+	validate) shift; remote_validate "$@" ;;
 	restore) shift; remote_restore "$@" ;;
+	packages) shift; remote_packages "$@" ;;
 	*) usage ;;
 esac

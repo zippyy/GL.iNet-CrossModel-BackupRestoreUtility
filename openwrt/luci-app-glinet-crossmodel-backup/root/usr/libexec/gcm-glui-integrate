@@ -1,0 +1,39 @@
+#!/bin/sh
+# Optional GL.iNet Admin Panel v4 integration. No-op on generic OpenWrt.
+
+set -u
+GL_HOME='/www/gl_home.html'
+HOOK='/www/js/gcm-glui-hook.js'
+TAG_PREFIX='<script data-gcm-glui="1" src="/js/gcm-glui-hook.js?v='
+
+clear_luci_cache() {
+	rm -f /tmp/luci-indexcache
+	rm -rf /tmp/luci-modulecache
+}
+
+remove_hook() {
+	[ -f "$GL_HOME" ] || return 0
+	# GL home is normally minified. Remove only the script element owned by
+	# this package; never rewrite unrelated vendor markup.
+	sed -i 's#<script data-gcm-glui="1" src="/js/gcm-glui-hook.js[^>]*></script>##g' "$GL_HOME"
+	clear_luci_cache
+}
+
+install_hook() {
+	[ -s /etc/glversion ] || return 0
+	[ -f "$GL_HOME" ] || return 0
+	[ -f "$HOOK" ] || return 1
+	grep -qF 'data-gcm-glui="1"' "$GL_HOME" && return 0
+	version=$(/usr/bin/glinet-crossmodel version 2>/dev/null || printf unknown)
+	temporary="/tmp/gcm-gl-home.$$"
+	sed "s#</body>#${TAG_PREFIX}${version}\"></script></body>#" "$GL_HOME" > "$temporary" || { rm -f "$temporary"; return 1; }
+	grep -qF 'data-gcm-glui="1"' "$temporary" || { rm -f "$temporary"; return 1; }
+	cat "$temporary" > "$GL_HOME"
+	rm -f "$temporary"
+}
+
+case "${1:-}" in
+	--remove) remove_hook ;;
+	'') install_hook; clear_luci_cache ;;
+	*) echo 'Usage: gcm-glui-integrate [--remove]' >&2; exit 2 ;;
+esac

@@ -1,0 +1,12 @@
+#!/bin/sh /etc/rc.common
+
+# shellcheck disable=SC2034 # rc.common consumes START.
+START=99
+
+start() {
+	/usr/libexec/gcm-glui-integrate || true
+}
+
+stop() {
+	/usr/libexec/gcm-glui-integrate --remove || true
+}
