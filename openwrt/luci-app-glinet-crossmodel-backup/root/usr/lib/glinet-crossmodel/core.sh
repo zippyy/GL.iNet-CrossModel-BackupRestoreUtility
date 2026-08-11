@@ -974,7 +974,7 @@ gcm_create() {
 	esac
 	gcm_capture_persistent "$prefix_dir" "$strategy" "$discovered" "$excluded" || { rm -rf "$work"; return 1; }
 	if gcm_has_category "$categories" packages; then
-		gcm_package_status_tsv > "$prefix_dir/source/packages.tsv"
+		gcm_package_status_tsv /usr/lib/opkg/status > "$prefix_dir/source/packages.tsv"
 		gcm_packages_json "$prefix_dir/packages.json" "$prefix_dir/source/packages.tsv"
 	else
 		printf '{"source_kernel":"%s","packages":[]}\n' "$(gcm_json_escape "$(uname -r 2>/dev/null || printf unknown)")" > "$prefix_dir/packages.json"
@@ -1052,7 +1052,7 @@ gcm_package_review_files() {
 	source_kernel=${3:-unknown}
 	for class in same different available unavailable kmod; do : > "$work/pkg-$class"; done
 	target="$work/target-packages.tsv"
-	gcm_package_status_tsv > "$target"
+	gcm_package_status_tsv /usr/lib/opkg/status > "$target"
 	feed="$work/feed-packages"
 	supported_arches=$(gcm_supported_package_arches | tr '\n' ' ')
 	feed_ok=1
