@@ -4,11 +4,6 @@ on:
   workflow_dispatch:
   push:
     branches: [OpenWRT]
-    paths:
-      - 'openwrt/**'
-      - 'tests/**'
-      - 'scripts/build-openwrt-ipk.sh'
-      - '.github/workflows/build-openwrt-ipk.yml'
 
 permissions:
   contents: write
