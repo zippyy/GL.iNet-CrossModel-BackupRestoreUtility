@@ -40,11 +40,14 @@ jobs:
       - name: Validate GL.iNet package
         run: |
           set -euo pipefail
-          ipk=$(find dist -maxdepth 1 -type f -name '*.ipk' | head -n1)
+          ipk=$(find dist -maxdepth 1 -type f -name '*.ipk' -print -quit)
           test -n "$ipk"
-          tar -tzf "$ipk" | grep -qx './debian-binary'
-          tar -tzf "$ipk" | grep -qx './data.tar.gz'
-          tar -tzf "$ipk" | grep -qx './control.tar.gz'
+          members=$(mktemp)
+          trap 'rm -f "$members"' EXIT
+          tar -tzf "$ipk" > "$members"
+          grep -Fxq './debian-binary' "$members"
+          grep -Fxq './data.tar.gz' "$members"
+          grep -Fxq './control.tar.gz' "$members"
           test "$(tar -xOzf "$ipk" ./debian-binary)" = '2.0'
 
       - name: Read package version
