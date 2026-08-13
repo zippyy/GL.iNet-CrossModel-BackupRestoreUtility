@@ -72,7 +72,7 @@ the local RPC path is usable before falling back.
 ## Install and use directly
 
 ```sh
-opkg install /tmp/luci-app-glinet-crossmodel-backup_2.0.0-1_all.ipk
+opkg install /tmp/luci-app-glinet-crossmodel-backup_2.0.0-3_all.ipk
 
 glinet-crossmodel facts
 glinet-crossmodel create \
@@ -118,6 +118,69 @@ glinet-crossmodel-remote facts 192.168.8.1 22 root key /root/.ssh/id_ed25519
 
 The LuCI workflow builds the longer create/validate/restore coordinator calls
 and cleans credentials and endpoint files on success, failure, or interruption.
+
+## Diagnostic logging
+
+The native OpenWrt package uses one structured logger across LuCI, the CLI,
+backup/validation/restore core, rollback, package handling, GL.iNet integration,
+and the agentless SSH/SCP coordinator. Every significant operation receives a
+correlation ID that is propagated from LuCI through the controller, local CLI,
+coordinator, and streamed remote runtime.
+
+The default level is `INFO`. Logs use the `glinet-crossmodel` syslog tag and a
+bounded RAM-backed file; the current file rotates once to `gcm.log.1` at 512 KB
+by default:
+
+```sh
+logread -e glinet-crossmodel
+tail -f /tmp/glinet-crossmodel/gcm.log
+```
+
+LuCI exposes the current level, recent entries, refresh, download, and clear
+controls under **Diagnostics / Logging**. State-changing logging controls use
+the same LuCI CSRF protection as backup and restore actions.
+
+Temporarily enable DEBUG logging:
+
+```sh
+uci set glinet_crossmodel.logging.level='debug'
+uci commit glinet_crossmodel
+```
+
+Enable TRACE only while reproducing a difficult issue:
+
+```sh
+uci set glinet_crossmodel.logging.level='trace'
+uci commit glinet_crossmodel
+```
+
+Restore normal logging:
+
+```sh
+uci set glinet_crossmodel.logging.level='info'
+uci commit glinet_crossmodel
+```
+
+For a single direct or coordinator invocation, `GCM_LOG_LEVEL=debug` overrides
+UCI and `GCM_TRACE=1` forces TRACE. Diagnostics never write to machine-readable
+stdout, so `facts`, `inspect`, `validate`, and `packages` remain valid JSON.
+Human restore progress (`APPLIED`, `ADAPTED`, `SKIPPED`, `PRESERVED`, and
+`DEFERRED`) remains a separate stdout channel.
+
+Log fields whose names imply passwords, secrets, tokens, private/preshared
+keys, certificates, TLS auth material, sessions, or CSRF data are centrally
+redacted. UCI diagnostics record package, section, option, action, and result,
+but never the option value.
+
+The defaults in `/etc/config/glinet_crossmodel` are:
+
+```text
+config logging 'logging'
+    option level 'info'
+    option syslog '1'
+    option file_log '1'
+    option max_log_kb '512'
+```
 
 ## Archive format v2
 
@@ -180,7 +243,7 @@ target GL.iNet OpenWrt 21.02 opkg while preserving `Architecture: all`:
 ```sh
 sh tests/run.sh
 bash scripts/build-openwrt-ipk.sh
-tar -tzf dist/luci-app-glinet-crossmodel-backup_2.0.0-1_all.ipk
+tar -tzf dist/luci-app-glinet-crossmodel-backup_2.0.0-3_all.ipk
 ```
 
 The build copies checked-in runtime source byte-for-byte. It does not patch or

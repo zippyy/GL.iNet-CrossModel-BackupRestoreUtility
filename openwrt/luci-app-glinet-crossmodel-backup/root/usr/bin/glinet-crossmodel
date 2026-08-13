@@ -38,11 +38,19 @@ all_categories='wifi,lan,dhcp,dns,firewall,timezone,ddns,vpn,packages,persistent
 command=${1:-}
 [ -n "$command" ] || usage
 shift || true
+GCM_CALLER_OP_ID=${GCM_OP_ID:-}
+GCM_COMPONENT=cli
+gcm_prepare_operation "$command"
+gcm_diag INFO "action=$command" 'stage=dispatch' 'msg=CLI operation accepted'
 
 case "$command" in
 	facts)
 		[ "$#" -eq 0 ] || usage
+		GCM_COMPONENT=facts
+		facts_started=$(date +%s 2>/dev/null || printf 0)
+		gcm_diag INFO 'action=facts' 'stage=start' 'msg=Router fact collection started'
 		gcm_facts_json
+		gcm_diag INFO 'action=facts' 'stage=complete' "elapsed_seconds=$(gcm_elapsed "$facts_started")" 'result=success' 'msg=Router facts emitted as JSON'
 		;;
 	version)
 		[ "$#" -eq 0 ] || usage
@@ -53,15 +61,16 @@ case "$command" in
 		# Portable Profile; no v1 archive is ever emitted.
 		if [ "$#" -eq 5 ] && [ "${1#--}" = "$1" ]; then
 			output=$1; profile_id=$2; categories=$3; scripts=$4; binaries=$5
+			GCM_OP_ID=$profile_id; export GCM_OP_ID
 			gcm_create "$output" portable "$profile_id" 'Portable Profile' '' "$categories" "$scripts" "$binaries"
 			exit
 		fi
-		output=''; strategy=portable; profile_id=$(gcm_uuid); name=''; notes=''; categories=$all_categories; scripts=/dev/null; binaries=/dev/null
+		output=''; strategy=portable; profile_id=$GCM_OP_ID; name=''; notes=''; categories=$all_categories; scripts=/dev/null; binaries=/dev/null
 		while [ "$#" -gt 0 ]; do
 			case "$1" in
 				--output) [ "$#" -ge 2 ] || usage; output=$2; shift 2 ;;
 				--strategy) [ "$#" -ge 2 ] || usage; strategy=$2; shift 2 ;;
-				--id) [ "$#" -ge 2 ] || usage; profile_id=$2; shift 2 ;;
+				--id) [ "$#" -ge 2 ] || usage; profile_id=$2; [ -n "$GCM_CALLER_OP_ID" ] || GCM_OP_ID=$2; export GCM_OP_ID; shift 2 ;;
 				--name) [ "$#" -ge 2 ] || usage; name=$2; shift 2 ;;
 				--notes) [ "$#" -ge 2 ] || usage; notes=$2; shift 2 ;;
 				--categories) [ "$#" -ge 2 ] || usage; categories=$2; shift 2 ;;

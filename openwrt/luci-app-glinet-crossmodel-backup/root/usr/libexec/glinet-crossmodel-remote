@@ -15,9 +15,44 @@ CLEANUP_AUTH=''
 CLEANUP_CREDENTIAL=''
 CLEANUP_PATHS=''
 
+if [ -r "$CORE" ]; then
+	# shellcheck source=/dev/null
+	. "$CORE"
+	GCM_COMPONENT=remote
+	GCM_SCOPE=remote
+	export GCM_COMPONENT GCM_SCOPE
+else
+	gcm_diag() { :; }
+	gcm_lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+	gcm_elapsed() { printf 'unknown\n'; }
+fi
+
 log() { printf '%s\n' "$*"; }
-die() { log "ERROR: $*" >&2; exit 1; }
+die() { gcm_diag ERROR "action=${GCM_ACTION:-remote}" "stage=${GCM_STAGE:-unknown}" "msg=$*"; log "ERROR: $*" >&2; exit 1; }
 shell_quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\"'\\\"'/g")"; }
+
+classify_ssh_error() {
+	error_text=$(gcm_lower "$1")
+	case "$error_text" in
+		*'remote host identification has changed'*|*'offending '*key*) printf 'changed-host-key\n' ;;
+		*'host key verification failed'*|*'no matching host key'*) printf 'unknown-or-rejected-host-key\n' ;;
+		*'permission denied'*|*'authentication failed'*|*'too many authentication failures'*) printf 'authentication-failure\n' ;;
+		*'connection timed out'*|*'operation timed out'*|*'connect to host '*' timed out'*) printf 'timeout\n' ;;
+		*'could not resolve hostname'*|*'name or service not known'*|*'temporary failure in name resolution'*) printf 'dns-failure\n' ;;
+		*'no route to host'*|*'network is unreachable'*|*'host is unreachable'*) printf 'host-unreachable\n' ;;
+		*'connection refused'*) printf 'connection-refused\n' ;;
+		*'no space left on device'*|*'disk quota exceeded'*) printf 'remote-disk-full\n' ;;
+		*'permission denied'*) printf 'permission-denied\n' ;;
+		*'not found'*|*'command not found'*) printf 'remote-command-missing\n' ;;
+		*) printf 'remote-shell-or-transport-failure\n' ;;
+	esac
+}
+
+safe_error_summary() {
+	file=$1
+	[ -s "$file" ] || { printf 'no stderr returned'; return; }
+	tail -n 4 "$file" 2>/dev/null | tr '\r\n\t' '   ' | sed 's/[[:cntrl:]]//g' | cut -c1-512
+}
 
 usage() {
 	cat >&2 <<'EOF'
@@ -47,15 +82,17 @@ remote_target() {
 
 prepare_connection() {
 	host=$1; port=$2; user=$3; auth=$4; credential=$5
+	GCM_STAGE=connection-parameters
+	gcm_diag INFO "action=${GCM_ACTION:-remote}" "stage=$GCM_STAGE" "host=$host" "port=$port" "user=$user" "auth=$auth" 'msg=Remote connection parameters validation started'
 	valid_host "$host" || die 'Remote host contains invalid characters.'
 	valid_port "$port" || die 'Remote SSH port must be 1 through 65535.'
 	valid_user "$user" || die 'Remote SSH username contains invalid characters.'
 	[ -r "$CORE" ] && [ -r "$CLI" ] || die 'Streamed runtime files are missing.'
-	command -v ssh >/dev/null 2>&1 || die 'OpenSSH client is not installed.'
-	command -v scp >/dev/null 2>&1 || die 'OpenSSH SCP client is not installed.'
+	command -v ssh >/dev/null 2>&1 || { GCM_STAGE=dependency; die 'OpenSSH client is not installed.'; }
+	command -v scp >/dev/null 2>&1 || { GCM_STAGE=dependency; die 'OpenSSH SCP client is not installed.'; }
 	command -v sha256sum >/dev/null 2>&1 || die 'sha256sum is not available on the controller.'
 	case "$auth" in
-		password) [ -f "$credential" ] || die 'Temporary SSH password file is missing.'; command -v sshpass >/dev/null 2>&1 || die 'sshpass is not installed.' ;;
+		password) [ -f "$credential" ] || die 'Temporary SSH password file is missing.'; command -v sshpass >/dev/null 2>&1 || { GCM_STAGE=dependency; die 'sshpass is not installed.'; } ;;
 		key) [ -f "$credential" ] || die 'SSH private-key file is missing.' ;;
 		agent) [ "$credential" = - ] || die 'Agent authentication credential must be -.' ;;
 		*) die 'SSH authentication must be password, key, or agent.' ;;
@@ -66,77 +103,143 @@ prepare_connection() {
 	chmod 700 "$known_hosts_dir"
 	touch "$KNOWN_HOSTS"
 	chmod 600 "$KNOWN_HOSTS"
+	credential_mode=$(ls -l "$credential" 2>/dev/null | awk '{print $1}' || printf unavailable)
+	gcm_diag INFO "action=${GCM_ACTION:-remote}" 'stage=authentication' "host=$host" "port=$port" "user=$user" "auth=$auth" "credential_path=$credential" "credential_mode=$credential_mode" 'result=validated' 'msg=Authentication mode selected; credential contents not logged'
+	gcm_diag DEBUG "action=${GCM_ACTION:-remote}" 'stage=known-hosts' "host=$host" "known_hosts=$KNOWN_HOSTS" 'result=ready' 'msg=Strict host-key checking configured'
 }
 
 ssh_run() {
 	host=$1; port=$2; user=$3; auth=$4; credential=$5; shift 5
 	target=$(remote_target "$host" "$user")
+	ssh_error=$(mktemp /tmp/gcm-ssh-error.XXXXXX) || die 'Could not create SSH diagnostic buffer.'
+	ssh_started=$(date +%s 2>/dev/null || printf 0)
+	gcm_diag INFO "action=${GCM_ACTION:-remote}" 'stage=connect' "host=$host" "port=$port" "user=$user" "auth=$auth" 'msg=SSH connection attempt'
+	status=0
 	case "$auth" in
 		password)
 			sshpass -f "$credential" ssh -o BatchMode=no -o PasswordAuthentication=yes \
 				-o ConnectTimeout=12 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 \
 				-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$KNOWN_HOSTS" \
-				-p "$port" "$target" "$@"
+				-p "$port" "$target" "$@" 2>"$ssh_error" || status=$?
 			;;
 		key)
 			ssh -i "$credential" -o IdentitiesOnly=yes -o BatchMode=yes \
 				-o ConnectTimeout=12 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 \
 				-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$KNOWN_HOSTS" \
-				-p "$port" "$target" "$@"
+				-p "$port" "$target" "$@" 2>"$ssh_error" || status=$?
 			;;
 		agent)
 			ssh -o BatchMode=yes -o ConnectTimeout=12 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 \
 				-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$KNOWN_HOSTS" \
-				-p "$port" "$target" "$@"
+				-p "$port" "$target" "$@" 2>"$ssh_error" || status=$?
 			;;
 	esac
+	if [ "$status" -ne 0 ]; then
+		detail=$(safe_error_summary "$ssh_error")
+		reason=$(classify_ssh_error "$detail")
+		gcm_diag ERROR "action=${GCM_ACTION:-remote}" 'stage=connect-or-command' "host=$host" "port=$port" "user=$user" "auth=$auth" "exit_code=$status" "elapsed_seconds=$(gcm_elapsed "$ssh_started")" "reason=$reason" "detail=$detail" 'result=failed'
+		cat "$ssh_error" >&2
+		rm -f "$ssh_error"
+		return "$status"
+	fi
+	rm -f "$ssh_error"
+	gcm_diag INFO "action=${GCM_ACTION:-remote}" 'stage=connected' "host=$host" "port=$port" "user=$user" "auth=$auth" "elapsed_seconds=$(gcm_elapsed "$ssh_started")" 'result=success' 'msg=SSH connection or remote command completed'
 }
 
 scp_to_remote() {
 	local_file=$1; host=$2; port=$3; user=$4; auth=$5; credential=$6; remote_path=$7
 	[ -f "$local_file" ] || die "Local input is missing: $local_file"
 	target=$(remote_target "$host" "$user")
+	transfer_error=$(mktemp /tmp/gcm-scp-error.XXXXXX) || die 'Could not create SCP diagnostic buffer.'
+	transfer_started=$(date +%s 2>/dev/null || printf 0)
+	file_size=$(wc -c < "$local_file" 2>/dev/null | tr -d ' ' || printf unknown)
+	gcm_diag INFO "action=${GCM_ACTION:-remote}" 'stage=upload-start' "host=$host" "port=$port" "user=$user" "auth=$auth" "local_path=$local_file" "remote_path=$remote_path" "file_size=$file_size" 'msg=SCP upload started'
+	status=0
 	case "$auth" in
-		password) sshpass -f "$credential" scp -O -o BatchMode=no -o PasswordAuthentication=yes -o ConnectTimeout=12 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$KNOWN_HOSTS" -P "$port" "$local_file" "${target}:${remote_path}" ;;
-		key) scp -O -i "$credential" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=12 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$KNOWN_HOSTS" -P "$port" "$local_file" "${target}:${remote_path}" ;;
-		agent) scp -O -o BatchMode=yes -o ConnectTimeout=12 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$KNOWN_HOSTS" -P "$port" "$local_file" "${target}:${remote_path}" ;;
+		password) sshpass -f "$credential" scp -O -o BatchMode=no -o PasswordAuthentication=yes -o ConnectTimeout=12 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$KNOWN_HOSTS" -P "$port" "$local_file" "${target}:${remote_path}" 2>"$transfer_error" || status=$? ;;
+		key) scp -O -i "$credential" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=12 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$KNOWN_HOSTS" -P "$port" "$local_file" "${target}:${remote_path}" 2>"$transfer_error" || status=$? ;;
+		agent) scp -O -o BatchMode=yes -o ConnectTimeout=12 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$KNOWN_HOSTS" -P "$port" "$local_file" "${target}:${remote_path}" 2>"$transfer_error" || status=$? ;;
 	esac
+	if [ "$status" -ne 0 ]; then
+		detail=$(safe_error_summary "$transfer_error"); reason=$(classify_ssh_error "$detail")
+		case "$detail" in *'No space left on device'*) reason=remote-disk-full ;; *'Permission denied'*) reason=permission-denied ;; esac
+		gcm_diag ERROR "action=${GCM_ACTION:-remote}" 'stage=upload' "host=$host" "remote_path=$remote_path" "file_size=$file_size" "exit_code=$status" "elapsed_seconds=$(gcm_elapsed "$transfer_started")" "reason=$reason" "detail=$detail" 'result=failed'
+		cat "$transfer_error" >&2; rm -f "$transfer_error"; return "$status"
+	fi
+	rm -f "$transfer_error"
+	gcm_diag INFO "action=${GCM_ACTION:-remote}" 'stage=upload-complete' "host=$host" "remote_path=$remote_path" "file_size=$file_size" "elapsed_seconds=$(gcm_elapsed "$transfer_started")" 'result=success'
 }
 
 scp_from_remote() {
 	host=$1; port=$2; user=$3; auth=$4; credential=$5; remote_path=$6; local_file=$7
 	target=$(remote_target "$host" "$user")
+	transfer_error=$(mktemp /tmp/gcm-scp-error.XXXXXX) || die 'Could not create SCP diagnostic buffer.'
+	transfer_started=$(date +%s 2>/dev/null || printf 0)
+	gcm_diag INFO "action=${GCM_ACTION:-remote}" 'stage=download-start' "host=$host" "port=$port" "user=$user" "auth=$auth" "remote_path=$remote_path" "local_path=$local_file" 'msg=SCP download started'
+	status=0
 	case "$auth" in
-		password) sshpass -f "$credential" scp -O -o BatchMode=no -o PasswordAuthentication=yes -o ConnectTimeout=12 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$KNOWN_HOSTS" -P "$port" "${target}:${remote_path}" "$local_file" ;;
-		key) scp -O -i "$credential" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=12 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$KNOWN_HOSTS" -P "$port" "${target}:${remote_path}" "$local_file" ;;
-		agent) scp -O -o BatchMode=yes -o ConnectTimeout=12 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$KNOWN_HOSTS" -P "$port" "${target}:${remote_path}" "$local_file" ;;
-	esac || { rm -f "$local_file"; die 'Could not download the remote archive.'; }
+		password) sshpass -f "$credential" scp -O -o BatchMode=no -o PasswordAuthentication=yes -o ConnectTimeout=12 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$KNOWN_HOSTS" -P "$port" "${target}:${remote_path}" "$local_file" 2>"$transfer_error" || status=$? ;;
+		key) scp -O -i "$credential" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=12 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$KNOWN_HOSTS" -P "$port" "${target}:${remote_path}" "$local_file" 2>"$transfer_error" || status=$? ;;
+		agent) scp -O -o BatchMode=yes -o ConnectTimeout=12 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$KNOWN_HOSTS" -P "$port" "${target}:${remote_path}" "$local_file" 2>"$transfer_error" || status=$? ;;
+	esac
+	if [ "$status" -ne 0 ]; then
+		detail=$(safe_error_summary "$transfer_error"); reason=$(classify_ssh_error "$detail")
+		gcm_diag ERROR "action=${GCM_ACTION:-remote}" 'stage=download' "host=$host" "remote_path=$remote_path" "exit_code=$status" "elapsed_seconds=$(gcm_elapsed "$transfer_started")" "reason=$reason" "detail=$detail" 'result=failed'
+		cat "$transfer_error" >&2; rm -f "$transfer_error"; rm -f "$local_file"; die 'Could not download the remote archive.'
+	fi
+	rm -f "$transfer_error"
 	[ -s "$local_file" ] || die 'Remote router returned an empty archive.'
+	file_size=$(wc -c < "$local_file" 2>/dev/null | tr -d ' ' || printf unknown)
+	gcm_diag INFO "action=${GCM_ACTION:-remote}" 'stage=download-complete' "host=$host" "remote_path=$remote_path" "local_path=$local_file" "file_size=$file_size" "elapsed_seconds=$(gcm_elapsed "$transfer_started")" 'result=success'
 }
 
 stream_cli() {
 	host=$1; port=$2; user=$3; auth=$4; credential=$5; shift 5
-	if [ "${GCM_DEFER_RELOAD:-0}" = 1 ]; then remote_command='env GCM_DEFER_RELOAD=1 sh -s --'; else remote_command='sh -s --'; fi
+	remote_action=${1:-unknown}
+	remote_level=${GCM_LOG_LEVEL:-info}
+	case "$remote_level" in error|warn|warning|info|debug|trace) ;; *) remote_level=info ;; esac
+	remote_command="env GCM_OP_ID=$(shell_quote "${GCM_OP_ID:-none}") GCM_SCOPE=remote GCM_LOG_LEVEL=$(shell_quote "$remote_level")"
+	[ "${GCM_TRACE:-0}" = 1 ] && remote_command="$remote_command GCM_TRACE=1"
+	[ "${GCM_DEFER_RELOAD:-0}" = 1 ] && remote_command="$remote_command GCM_DEFER_RELOAD=1"
+	remote_command="$remote_command sh -s --"
 	for argument in "$@"; do remote_command="$remote_command $(shell_quote "$argument")"; done
-	{ cat "$CORE"; printf '\n'; cat "$CLI"; } | ssh_run "$host" "$port" "$user" "$auth" "$credential" "$remote_command"
+	stream_started=$(date +%s 2>/dev/null || printf 0)
+	gcm_diag INFO "action=${GCM_ACTION:-remote}" 'stage=runtime-stream-start' "host=$host" "remote_action=$remote_action" 'msg=Agentless runtime streaming started'
+	if { cat "$CORE"; printf '\n'; cat "$CLI"; } | ssh_run "$host" "$port" "$user" "$auth" "$credential" "$remote_command"; then
+		gcm_diag INFO "action=${GCM_ACTION:-remote}" 'stage=runtime-stream-complete' "host=$host" "remote_action=$remote_action" "elapsed_seconds=$(gcm_elapsed "$stream_started")" 'result=success'
+		return 0
+	else status=$?; fi
+	gcm_diag ERROR "action=${GCM_ACTION:-remote}" 'stage=runtime-stream' "host=$host" "remote_action=$remote_action" "exit_code=$status" "elapsed_seconds=$(gcm_elapsed "$stream_started")" 'result=failed' 'reason=remote-command-exit-status'
+	return "$status"
 }
 
 local_sha256() { sha256sum "$1" | awk '{print $1}'; }
 
 verify_remote_copy() {
 	local_file=$1; host=$2; port=$3; user=$4; auth=$5; credential=$6; remote_path=$7
+	verify_started=$(date +%s 2>/dev/null || printf 0)
 	local_sum=$(local_sha256 "$local_file")
-	remote_output=$(ssh_run "$host" "$port" "$user" "$auth" "$credential" "sha256sum $(shell_quote "$remote_path") 2>/dev/null") || die 'Could not calculate SHA-256 on the remote router.'
+	gcm_diag DEBUG "action=${GCM_ACTION:-remote}" 'stage=transfer-verification' "host=$host" "local_path=$local_file" "remote_path=$remote_path" "local_sha256=$local_sum" 'msg=Remote transfer checksum verification started'
+	remote_output=$(ssh_run "$host" "$port" "$user" "$auth" "$credential" "sha256sum $(shell_quote "$remote_path") 2>/dev/null") || { GCM_STAGE=transfer-verification; die 'Could not calculate SHA-256 on the remote router.'; }
 	remote_sum=${remote_output%% *}
-	[ "$local_sum" = "$remote_sum" ] || die "Remote transfer SHA-256 mismatch (local $local_sum, remote ${remote_sum:-missing})."
-	ssh_run "$host" "$port" "$user" "$auth" "$credential" "tar -tzf $(shell_quote "$remote_path") >/dev/null 2>&1" || die 'Remote router cannot read the transferred archive.'
+	if [ "$local_sum" != "$remote_sum" ]; then
+		gcm_diag ERROR "action=${GCM_ACTION:-remote}" 'stage=transfer-verification' "host=$host" "local_sha256=$local_sum" "remote_sha256=${remote_sum:-missing}" 'result=failed' 'reason=checksum-mismatch'
+		die "Remote transfer SHA-256 mismatch (local $local_sum, remote ${remote_sum:-missing})."
+	fi
+	ssh_run "$host" "$port" "$user" "$auth" "$credential" "tar -tzf $(shell_quote "$remote_path") >/dev/null 2>&1" || { GCM_STAGE=transfer-verification; die 'Remote router cannot read the transferred archive.'; }
+	gcm_diag INFO "action=${GCM_ACTION:-remote}" 'stage=transfer-verification' "host=$host" "local_sha256=$local_sum" "remote_sha256=$remote_sum" "elapsed_seconds=$(gcm_elapsed "$verify_started")" 'result=success' 'msg=Transfer checksum and archive readability verified'
 }
 
 cleanup_remote() {
 	host=$1; port=$2; user=$3; auth=$4; credential=$5; shift 5
 	command='rm -f'
 	for path in "$@"; do command="$command $(shell_quote "$path")"; done
-	ssh_run "$host" "$port" "$user" "$auth" "$credential" "$command" >/dev/null 2>&1 || true
+	gcm_diag DEBUG "action=${GCM_ACTION:-remote}" 'stage=cleanup-start' "host=$host" "paths=$*" 'msg=Remote cleanup started'
+	if ssh_run "$host" "$port" "$user" "$auth" "$credential" "$command" >/dev/null 2>&1; then
+		gcm_diag INFO "action=${GCM_ACTION:-remote}" 'stage=cleanup-complete' "host=$host" 'result=success'
+	else
+		status=$?; gcm_diag WARN "action=${GCM_ACTION:-remote}" 'stage=cleanup' "host=$host" "exit_code=$status" 'result=failed' 'reason=remote-cleanup-failure'
+	fi
 }
 
 track_cleanup() {
@@ -162,8 +265,12 @@ trap cleanup_tracked EXIT HUP INT TERM
 
 remote_facts() {
 	[ "$#" -eq 5 ] || usage
+	gcm_prepare_operation remote-facts
+	GCM_ACTION=facts; export GCM_ACTION
+	remote_started=$(date +%s 2>/dev/null || printf 0)
+	gcm_diag INFO 'action=facts' 'stage=start' "host=$1" "port=$2" "user=$3" "auth=$4" 'msg=Remote facts operation started'
 	prepare_connection "$@"
-	stream_cli "$@" facts
+	if stream_cli "$@" facts; then gcm_diag INFO 'action=facts' 'stage=complete' "host=$1" "elapsed_seconds=$(gcm_elapsed "$remote_started")" 'result=success'; else status=$?; gcm_diag ERROR 'action=facts' 'stage=complete' "host=$1" "exit_code=$status" 'result=failed'; return "$status"; fi
 }
 
 remote_create() {
@@ -171,6 +278,9 @@ remote_create() {
 	output=$1; strategy=$2; id=$3; name=$4; notes=$5; categories=$6; scripts=$7; binaries=$8; host=$9
 	shift 9; port=$1; user=$2; auth=$3; credential=$4
 	valid_id "$id" || die 'Invalid profile UUID.'
+	GCM_OP_ID=$id; GCM_ACTION=create; export GCM_OP_ID GCM_ACTION
+	remote_started=$(date +%s 2>/dev/null || printf 0)
+	gcm_diag INFO 'action=create' 'stage=start' "host=$host" "port=$port" "user=$user" "auth=$auth" "strategy=$strategy" "archive=$output" "profile_uuid=$id" "categories=$categories" 'msg=Remote backup operation started'
 	prepare_connection "$host" "$port" "$user" "$auth" "$credential"
 	remote_base="/tmp/gcm-$id"
 	remote_archive="$remote_base.tar.gz"; remote_scripts="$remote_base-scripts"; remote_binaries="$remote_base-binaries"
@@ -184,6 +294,7 @@ remote_create() {
 	verify_remote_copy "$output" "$host" "$port" "$user" "$auth" "$credential" "$remote_archive"
 	cleanup_remote "$host" "$port" "$user" "$auth" "$credential" "$remote_archive" "$remote_scripts" "$remote_binaries"
 	clear_cleanup
+	gcm_diag INFO 'action=create' 'stage=complete' "host=$host" "archive=$output" "file_size=$(wc -c < "$output" 2>/dev/null | tr -d ' ' || printf unknown)" "elapsed_seconds=$(gcm_elapsed "$remote_started")" 'result=success' 'msg=Remote backup downloaded and verified'
 	log "CREATED=$output"
 	log "REMOTE_SOURCE=$host"
 }
@@ -192,6 +303,9 @@ remote_validate() {
 	[ "$#" -eq 9 ] || usage
 	archive=$1; id=$2; categories=$3; override=$4; host=$5; port=$6; user=$7; auth=$8; credential=$9
 	valid_id "$id" || die 'Invalid operation UUID.'
+	GCM_OP_ID=$id; GCM_ACTION=validate; export GCM_OP_ID GCM_ACTION
+	remote_started=$(date +%s 2>/dev/null || printf 0)
+	gcm_diag INFO 'action=validate' 'stage=start' "host=$host" "port=$port" "user=$user" "auth=$auth" "archive=$archive" "categories=$categories" "dangerous_override=$override" 'msg=Remote validation operation started'
 	prepare_connection "$host" "$port" "$user" "$auth" "$credential"
 	remote_archive="/tmp/gcm-validate-$id.tar.gz"
 	track_cleanup "$host" "$port" "$user" "$auth" "$credential" "$remote_archive"
@@ -204,6 +318,7 @@ remote_validate() {
 	fi
 	cleanup_remote "$host" "$port" "$user" "$auth" "$credential" "$remote_archive"
 	clear_cleanup
+	if [ "$status" -eq 0 ]; then gcm_diag INFO 'action=validate' 'stage=complete' "host=$host" "elapsed_seconds=$(gcm_elapsed "$remote_started")" 'result=success'; else gcm_diag ERROR 'action=validate' 'stage=complete' "host=$host" "exit_code=$status" "elapsed_seconds=$(gcm_elapsed "$remote_started")" 'result=failed'; fi
 	return "$status"
 }
 
@@ -212,6 +327,9 @@ remote_restore() {
 	archive=$1; id=$2; categories=$3; packages=$4; direct=$5; override=$6; allow_legacy=$7; host=$8; port=$9
 	shift 9; user=$1; auth=$2; credential=$3
 	valid_id "$id" || die 'Invalid operation UUID.'
+	GCM_OP_ID=$id; GCM_ACTION=restore; export GCM_OP_ID GCM_ACTION
+	remote_started=$(date +%s 2>/dev/null || printf 0)
+	gcm_diag INFO 'action=restore' 'stage=start' "host=$host" "port=$port" "user=$user" "auth=$auth" "archive=$archive" "categories=$categories" "direct_custom_files=$direct" "dangerous_override=$override" "allow_legacy=$allow_legacy" "package_selection=$packages" 'msg=Remote restore operation started'
 	prepare_connection "$host" "$port" "$user" "$auth" "$credential"
 	remote_archive="/tmp/gcm-restore-$id.tar.gz"
 	track_cleanup "$host" "$port" "$user" "$auth" "$credential" "$remote_archive"
@@ -227,12 +345,17 @@ remote_restore() {
 	fi
 	cleanup_remote "$host" "$port" "$user" "$auth" "$credential" "$remote_archive"
 	clear_cleanup
+	gcm_diag INFO 'action=restore' 'stage=complete' "host=$host" "elapsed_seconds=$(gcm_elapsed "$remote_started")" 'result=success' 'msg=Remote restore completed with connectivity reload deferred'
 	log "REMOTE_TARGET=$host"
 }
 
 remote_packages() {
 	[ "$#" -eq 7 ] || usage
 	archive=$1; id=$2; host=$3; port=$4; user=$5; auth=$6; credential=$7
+	valid_id "$id" || die 'Invalid operation UUID.'
+	GCM_OP_ID=$id; GCM_ACTION=packages; export GCM_OP_ID GCM_ACTION
+	remote_started=$(date +%s 2>/dev/null || printf 0)
+	gcm_diag INFO 'action=packages' 'stage=start' "host=$host" "port=$port" "user=$user" "auth=$auth" "archive=$archive" 'msg=Remote Package Review started'
 	prepare_connection "$host" "$port" "$user" "$auth" "$credential"
 	remote_archive="/tmp/gcm-packages-$id.tar.gz"
 	track_cleanup "$host" "$port" "$user" "$auth" "$credential" "$remote_archive"
@@ -241,14 +364,17 @@ remote_packages() {
 	if stream_cli "$host" "$port" "$user" "$auth" "$credential" packages "$remote_archive"; then status=0; else status=$?; fi
 	cleanup_remote "$host" "$port" "$user" "$auth" "$credential" "$remote_archive"
 	clear_cleanup
+	if [ "$status" -eq 0 ]; then gcm_diag INFO 'action=packages' 'stage=complete' "host=$host" "elapsed_seconds=$(gcm_elapsed "$remote_started")" 'result=success'; else gcm_diag ERROR 'action=packages' 'stage=complete' "host=$host" "exit_code=$status" 'result=failed'; fi
 	return "$status"
 }
 
-case "${1:-}" in
-	facts) shift; remote_facts "$@" ;;
-	create) shift; remote_create "$@" ;;
-	validate) shift; remote_validate "$@" ;;
-	restore) shift; remote_restore "$@" ;;
-	packages) shift; remote_packages "$@" ;;
-	*) usage ;;
-esac
+if [ "${GCM_REMOTE_LIBRARY_ONLY:-0}" != 1 ]; then
+	case "${1:-}" in
+		facts) shift; remote_facts "$@" ;;
+		create) shift; remote_create "$@" ;;
+		validate) shift; remote_validate "$@" ;;
+		restore) shift; remote_restore "$@" ;;
+		packages) shift; remote_packages "$@" ;;
+		*) usage ;;
+	esac
+fi

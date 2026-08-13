@@ -13,14 +13,142 @@ GCM_TOOL_VERSION='2.0.0'
 GCM_MAX_FILE_BYTES=${GCM_MAX_FILE_BYTES:-8388608}
 GCM_MAX_TOTAL_BYTES=${GCM_MAX_TOTAL_BYTES:-33554432}
 GCM_PATH=${GCM_PATH:-/usr/sbin:/usr/bin:/sbin:/bin}
+GCM_LOG_TAG=${GCM_LOG_TAG:-glinet-crossmodel}
+GCM_LOG_DIR=${GCM_LOG_DIR:-/tmp/glinet-crossmodel}
+GCM_LOG_FILE=${GCM_LOG_FILE:-$GCM_LOG_DIR/gcm.log}
+GCM_COMPONENT=${GCM_COMPONENT:-core}
+GCM_SCOPE=${GCM_SCOPE:-local}
 PATH=$GCM_PATH
 export PATH
 
+# Human-readable command output is intentionally distinct from diagnostics.
+# Machine-readable commands write JSON only to stdout; gcm_diag writes solely
+# to syslog and the bounded RAM-backed troubleshooting log.
 gcm_log() { printf '%s\n' "$*"; }
-gcm_die() { gcm_log "ERROR: $*" >&2; return 1; }
 gcm_have() { command -v "$1" >/dev/null 2>&1; }
 gcm_trim() { printf '%s' "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'; }
 gcm_lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+gcm_log_rank() {
+	case "$(gcm_lower "$1")" in error) printf '0\n' ;; warn|warning) printf '1\n' ;; info) printf '2\n' ;; debug) printf '3\n' ;; trace) printf '4\n' ;; *) printf '2\n' ;; esac
+}
+
+gcm_logging_option() {
+	option=$1
+	fallback=$2
+	environment=$3
+	eval "configured=\${$environment:-}"
+	if [ -n "$configured" ]; then printf '%s\n' "$configured"; return; fi
+	if gcm_have uci; then
+		configured=$(uci -q get "glinet_crossmodel.logging.$option" 2>/dev/null || true)
+		[ -n "$configured" ] && { printf '%s\n' "$configured"; return; }
+	fi
+	printf '%s\n' "$fallback"
+}
+
+gcm_logging_init() {
+	[ "${GCM_LOGGING_INITIALIZED:-0}" = 1 ] && return 0
+	GCM_EFFECTIVE_LOG_LEVEL=$(gcm_logging_option level info GCM_LOG_LEVEL)
+	GCM_EFFECTIVE_FILE_LOG=$(gcm_logging_option file_log 1 GCM_FILE_LOG)
+	GCM_EFFECTIVE_SYSLOG=$(gcm_logging_option syslog 1 GCM_SYSLOG)
+	GCM_EFFECTIVE_MAX_LOG_KB=$(gcm_logging_option max_log_kb 512 GCM_MAX_LOG_KB)
+	GCM_LOGGING_INITIALIZED=1
+}
+
+gcm_log_level() {
+	if [ "${GCM_TRACE:-0}" = 1 ]; then printf 'trace\n'; return; fi
+	gcm_logging_init
+	level=$GCM_EFFECTIVE_LOG_LEVEL
+	case "$(gcm_lower "$level")" in error|warn|warning|info|debug|trace) gcm_lower "$level" ;; *) printf 'info\n' ;; esac
+}
+
+gcm_sensitive_name() {
+	case "$(gcm_lower "$1")" in
+		*password*|*passwd*|*secret*|*token*|*authkey*|*private_key*|*privatekey*|*preshared_key*|*csrf*|*session*|key|*_key|key_*|cert|*_cert|cert_*|*certificate*|ca|*_ca|ca_*|tls_auth|tls_crypt) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+gcm_log_clean() {
+	# Single-line, grep-friendly fields. Quotes and control characters cannot
+	# inject additional log records or break the key=value representation.
+	printf '%s' "$1" | tr '\r\n\t' '   ' | sed 's/[[:cntrl:]]//g;s/\\/\\\\/g;s/"/\\"/g' | cut -c1-1024
+}
+
+gcm_log_field() {
+	field_name=$1
+	field_value=$2
+	if gcm_sensitive_name "$field_name"; then field_value='[REDACTED]'; fi
+	printf '%s="%s"' "$field_name" "$(gcm_log_clean "$field_value")"
+}
+
+gcm_log_rotate() {
+	gcm_logging_init
+	max_kb=$GCM_EFFECTIVE_MAX_LOG_KB
+	case "$max_kb" in ''|*[!0-9]*) max_kb=512 ;; esac
+	[ "$max_kb" -ge 64 ] 2>/dev/null || max_kb=64
+	max_bytes=$((max_kb * 1024))
+	[ -f "$GCM_LOG_FILE" ] || return 0
+	current_bytes=$(wc -c < "$GCM_LOG_FILE" 2>/dev/null | tr -d ' ' || printf 0)
+	case "$current_bytes" in ''|*[!0-9]*) current_bytes=0 ;; esac
+	if [ "$current_bytes" -ge "$max_bytes" ]; then
+		rm -f "$GCM_LOG_FILE.1"
+		mv "$GCM_LOG_FILE" "$GCM_LOG_FILE.1" 2>/dev/null || : > "$GCM_LOG_FILE"
+	fi
+}
+
+gcm_diag() {
+	severity=$(printf '%s' "${1:-INFO}" | tr '[:lower:]' '[:upper:]')
+	shift || true
+	configured_level=$(gcm_log_level)
+	[ "$(gcm_log_rank "$severity")" -le "$(gcm_log_rank "$configured_level")" ] || return 0
+	timestamp=$(date -u +'%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date)
+	operation=${GCM_OP_ID:-none}
+	line="$timestamp $severity op=$(gcm_log_clean "$operation") component=$(gcm_log_clean "${GCM_COMPONENT:-core}") scope=$(gcm_log_clean "${GCM_SCOPE:-local}")"
+	for field in "$@"; do
+		case "$field" in
+			*=*) field_name=${field%%=*}; field_value=${field#*=}; line="$line $(gcm_log_field "$field_name" "$field_value")" ;;
+			*) line="$line $(gcm_log_field msg "$field")" ;;
+		esac
+	done
+	gcm_logging_init
+	file_enabled=$GCM_EFFECTIVE_FILE_LOG
+	if [ "$file_enabled" != 0 ]; then
+		mkdir -p "$GCM_LOG_DIR" 2>/dev/null || true
+		chmod 700 "$GCM_LOG_DIR" 2>/dev/null || true
+		gcm_log_rotate
+		(umask 077; printf '%s\n' "$line" >> "$GCM_LOG_FILE") 2>/dev/null || true
+	fi
+	syslog_enabled=$GCM_EFFECTIVE_SYSLOG
+	if [ "$syslog_enabled" != 0 ] && gcm_have logger; then
+		case "$severity" in ERROR) priority=daemon.err ;; WARN) priority=daemon.warning ;; DEBUG|TRACE) priority=daemon.debug ;; *) priority=daemon.info ;; esac
+		logger -t "$GCM_LOG_TAG" -p "$priority" -- "$line" 2>/dev/null || logger -t "$GCM_LOG_TAG" "$line" 2>/dev/null || true
+	fi
+}
+
+gcm_prepare_operation() {
+	action=${1:-operation}
+	if ! gcm_valid_uuid "${GCM_OP_ID:-}"; then GCM_OP_ID=$(gcm_uuid); fi
+	GCM_ACTION=$action
+	export GCM_OP_ID GCM_ACTION GCM_COMPONENT GCM_SCOPE
+}
+
+gcm_elapsed() {
+	started=${1:-0}
+	now=$(date +%s 2>/dev/null || printf 0)
+	case "$started:$now" in *[!0-9:]*) printf 'unknown\n' ;; *) printf '%s\n' "$((now - started))" ;; esac
+}
+
+gcm_file_size() {
+	[ -f "$1" ] || { printf 'missing\n'; return; }
+	wc -c < "$1" 2>/dev/null | tr -d ' ' || printf 'unknown\n'
+}
+
+gcm_die() {
+	gcm_diag ERROR "action=${GCM_ACTION:-operation}" "stage=${GCM_STAGE:-unknown}" "msg=$*"
+	printf 'ERROR: %s\n' "$*" >&2
+	return 1
+}
 
 gcm_json_escape() {
 	printf '%s' "$1" | awk 'BEGIN{ORS=""} {
@@ -118,6 +246,8 @@ gcm_member_under_prefix() {
 gcm_check_archive_members() {
 	archive=$1
 	mode=${2:-v2}
+	GCM_STAGE=member-safety
+	gcm_diag DEBUG "action=${GCM_ACTION:-archive}" "stage=$GCM_STAGE" "archive=$archive" "archive_type=$mode" 'msg=Archive member validation started'
 	[ -f "$archive" ] || gcm_die 'Archive is missing.' || return 1
 	members=$(mktemp /tmp/gcm-members.XXXXXX) || return 1
 	if ! tar -tzf "$archive" > "$members" 2>/dev/null; then
@@ -140,6 +270,7 @@ gcm_check_archive_members() {
 		rm -f "$members"; gcm_die 'Archive contains a non-file/non-directory member.'; return 1
 	fi
 	rm -f "$members"
+	gcm_diag DEBUG "action=${GCM_ACTION:-archive}" "stage=$GCM_STAGE" "member_count=$member_count" 'result=pass' 'msg=Archive members are safe'
 }
 
 gcm_archive_kind() {
@@ -155,6 +286,9 @@ gcm_archive_kind() {
 gcm_extract_archive() {
 	archive=$1
 	destination=$2
+	GCM_STAGE=archive-format
+	archive_size=$(gcm_file_size "$archive")
+	gcm_diag DEBUG "action=${GCM_ACTION:-archive}" "stage=$GCM_STAGE" "archive=$archive" "archive_size=$archive_size" 'msg=Archive format detection started'
 	kind=$(gcm_archive_kind "$archive")
 	case "$kind" in
 		v2) gcm_check_archive_members "$archive" v2 || return 1 ;;
@@ -162,7 +296,9 @@ gcm_extract_archive() {
 		*) gcm_die 'Archive does not use a supported v2 or legacy v1 prefix.'; return 1 ;;
 	esac
 	mkdir -p "$destination" || return 1
+	GCM_STAGE=extract
 	tar -C "$destination" -xzf "$archive" || { gcm_die 'Archive extraction failed.'; return 1; }
+	gcm_diag DEBUG "action=${GCM_ACTION:-archive}" 'stage=archive-format' "archive_type=$kind" 'result=pass' "destination=$destination" 'msg=Archive extracted safely'
 	printf '%s\n' "$kind"
 }
 
@@ -178,6 +314,8 @@ gcm_manifest_field() {
 
 gcm_validate_v2_manifest() {
 	manifest=$1
+	GCM_STAGE=manifest
+	gcm_diag DEBUG "action=${GCM_ACTION:-archive}" "stage=$GCM_STAGE" "manifest=$manifest" 'msg=Manifest validation started'
 	[ -f "$manifest" ] || { gcm_die 'Archive is missing manifest.json.'; return 1; }
 	manifest_format=$(gcm_manifest_field "$manifest" format)
 	manifest_version=$(gcm_manifest_field "$manifest" format_version)
@@ -192,10 +330,14 @@ gcm_validate_v2_manifest() {
 		case "$manifest_fingerprint" in *[!A-Fa-f0-9]*|'') gcm_die 'Device Snapshot fingerprint is invalid.'; return 1 ;; esac
 		[ "${#manifest_fingerprint}" -eq 64 ] || { gcm_die 'Device Snapshot fingerprint length is invalid.'; return 1; }
 	fi
+	gcm_diag DEBUG "action=${GCM_ACTION:-archive}" "stage=$GCM_STAGE" "manifest_version=$manifest_version" "strategy=$manifest_strategy" "profile_uuid=$manifest_profile_id" 'result=pass' 'msg=Manifest validation completed'
 }
 
 gcm_generate_checksums() {
 	root=$1
+	GCM_STAGE=checksums
+	checksum_started=$(date +%s 2>/dev/null || printf 0)
+	gcm_diag DEBUG "action=${GCM_ACTION:-create}" "stage=$GCM_STAGE" 'msg=Checksum generation started'
 	list=$(mktemp /tmp/gcm-check-list.XXXXXX) || return 1
 	(
 		cd "$root" || exit 1
@@ -205,12 +347,17 @@ gcm_generate_checksums() {
 			sha256sum "$path"
 		done < "$list" > "$GCM_PREFIX/checksums.sha256"
 	) || { rm -f "$list"; gcm_die 'Could not generate SHA-256 payload hashes.'; return 1; }
+	checksum_count=$(wc -l < "$root/$GCM_PREFIX/checksums.sha256" 2>/dev/null | tr -d ' ' || printf 0)
 	rm -f "$list"
+	gcm_diag INFO "action=${GCM_ACTION:-create}" "stage=$GCM_STAGE" "files=$checksum_count" "elapsed_seconds=$(gcm_elapsed "$checksum_started")" 'result=pass' 'msg=Checksum generation completed'
 }
 
 gcm_verify_checksums() {
 	prefix_dir=$1
 	checksums="$prefix_dir/checksums.sha256"
+	GCM_STAGE=checksums
+	checksum_started=$(date +%s 2>/dev/null || printf 0)
+	gcm_diag DEBUG "action=${GCM_ACTION:-validate}" "stage=$GCM_STAGE" "checksums=$checksums" 'msg=Checksum verification started'
 	[ -s "$checksums" ] || { gcm_die 'Archive is missing checksums.sha256.'; return 1; }
 	if awk '{print $2}' "$checksums" | sort | uniq -d | grep -q .; then gcm_die 'SHA-256 manifest contains duplicate member paths.'; return 1; fi
 	actual=$(mktemp /tmp/gcm-hash-actual.XXXXXX) || return 1
@@ -236,7 +383,17 @@ gcm_verify_checksums() {
 		case "$path" in "$GCM_PREFIX"/*) ;; *) gcm_die "SHA-256 entry is outside $GCM_PREFIX/: $path"; return 1 ;; esac
 		[ -f "$(dirname "$prefix_dir")/$path" ] || { gcm_die "SHA-256 entry references a missing payload: $path"; return 1; }
 	done < "$checksums"
-	(cd "$(dirname "$prefix_dir")" && sha256sum -c "$GCM_PREFIX/checksums.sha256" >/dev/null 2>&1) || { gcm_die 'Archive SHA-256 verification failed.'; return 1; }
+	verify_output=$(mktemp /tmp/gcm-hash-verify.XXXXXX) || return 1
+	if ! (cd "$(dirname "$prefix_dir")" && sha256sum -c "$GCM_PREFIX/checksums.sha256" > "$verify_output" 2>&1); then
+		failed_file=$(sed -n 's/: FAILED$//p;s/: FAILED open or read$//p' "$verify_output" | sed -n '1p')
+		gcm_diag ERROR "action=${GCM_ACTION:-validate}" "stage=$GCM_STAGE" 'reason=sha256-mismatch' "file=${failed_file:-unknown}" 'result=failed' 'msg=Archive checksum verification failed'
+		rm -f "$verify_output"
+		gcm_die 'Archive SHA-256 verification failed.'
+		return 1
+	fi
+	rm -f "$verify_output"
+	checksum_count=$(wc -l < "$checksums" 2>/dev/null | tr -d ' ' || printf 0)
+	gcm_diag DEBUG "action=${GCM_ACTION:-validate}" "stage=$GCM_STAGE" "files=$checksum_count" "elapsed_seconds=$(gcm_elapsed "$checksum_started")" 'result=pass' 'msg=Checksum verification completed'
 }
 
 gcm_board_json_value() {
@@ -352,20 +509,37 @@ gcm_gl_rpc_has() {
 
 gcm_adapter_set() {
 	adapter_package=$1; adapter_section=$2; adapter_option=$3; adapter_value=$4
+	gcm_diag DEBUG "action=${GCM_ACTION:-restore}" 'stage=apply' "uci_package=$adapter_package" "section=$adapter_section" "option=$adapter_option" 'action_name=set' 'msg=Applying UCI option (value omitted)'
 	if gcm_gl_rpc_has set && case "$adapter_section" in @*) false ;; *) true ;; esac; then
 		adapter_request=$(printf '{"config":"%s","section":"%s","values":{"%s":"%s"}}' "$(gcm_json_escape "$adapter_package")" "$(gcm_json_escape "$adapter_section")" "$(gcm_json_escape "$adapter_option")" "$(gcm_json_escape "$adapter_value")")
-		if ubus call uci set "$adapter_request" >/dev/null 2>&1; then return 0; fi
+		if ubus call uci set "$adapter_request" >/dev/null 2>&1; then
+			gcm_diag TRACE "action=${GCM_ACTION:-restore}" 'stage=apply' "uci_package=$adapter_package" "section=$adapter_section" "option=$adapter_option" 'adapter=glinet-4' 'result=success'
+			return 0
+		fi
+		gcm_diag WARN "action=${GCM_ACTION:-restore}" 'stage=apply' "uci_package=$adapter_package" "section=$adapter_section" "option=$adapter_option" 'adapter=glinet-4' 'result=fallback' 'msg=GL.iNet UCI RPC failed; using local UCI'
 	fi
-	uci set "$adapter_package.$adapter_section.$adapter_option=$adapter_value"
+	if uci set "$adapter_package.$adapter_section.$adapter_option=$adapter_value"; then return 0; else status=$?; fi
+	gcm_diag ERROR "action=${GCM_ACTION:-restore}" 'stage=apply' "uci_package=$adapter_package" "section=$adapter_section" "option=$adapter_option" 'action_name=set' "exit_code=$status" 'result=failed'
+	return "$status"
 }
 
 gcm_adapter_commit() {
 	adapter_commit_package=$1
+	gcm_diag DEBUG "action=${GCM_ACTION:-restore}" 'stage=commit' "uci_package=$adapter_commit_package" 'action_name=commit' 'msg=UCI commit started'
 	if gcm_gl_rpc_has commit; then
 		adapter_commit_request=$(printf '{"config":"%s"}' "$(gcm_json_escape "$adapter_commit_package")")
-		if ubus call uci commit "$adapter_commit_request" >/dev/null 2>&1; then return 0; fi
+		if ubus call uci commit "$adapter_commit_request" >/dev/null 2>&1; then
+			gcm_diag DEBUG "action=${GCM_ACTION:-restore}" 'stage=commit' "uci_package=$adapter_commit_package" 'adapter=glinet-4' 'result=success'
+			return 0
+		fi
+		gcm_diag WARN "action=${GCM_ACTION:-restore}" 'stage=commit' "uci_package=$adapter_commit_package" 'adapter=glinet-4' 'result=fallback' 'msg=GL.iNet UCI RPC commit failed; using local UCI'
 	fi
-	uci commit "$adapter_commit_package"
+	if uci commit "$adapter_commit_package"; then
+		gcm_diag DEBUG "action=${GCM_ACTION:-restore}" 'stage=commit' "uci_package=$adapter_commit_package" 'adapter=openwrt-uci' 'result=success'
+		return 0
+	else status=$?; fi
+	gcm_diag ERROR "action=${GCM_ACTION:-restore}" 'stage=commit' "uci_package=$adapter_commit_package" 'action_name=commit' "exit_code=$status" 'result=failed'
+	return "$status"
 }
 
 gcm_band_from_values() {
@@ -539,6 +713,20 @@ gcm_portable_add() {
 }
 
 gcm_uci_get() { uci -q get "$1" 2>/dev/null || true; }
+
+gcm_uci_type_count() {
+	count_package=$1
+	count_type=$2
+	uci -q show "$count_package" 2>/dev/null | grep -c "=$count_type$" 2>/dev/null || true
+}
+
+gcm_category_log() {
+	severity=$1
+	category=$2
+	stage=$3
+	shift 3
+	gcm_diag "$severity" "action=${GCM_ACTION:-operation}" "category=$category" "stage=$stage" "$@"
+}
 
 gcm_capture_portable_wifi() {
 	config_dir=$1
@@ -714,15 +902,36 @@ gcm_capture_portable() {
 	config_dir="$prefix_dir/portable"
 	mkdir -p "$config_dir/vpn"
 	: > "$config_dir/profile"
-	if gcm_has_category "$categories" wifi; then gcm_capture_portable_wifi "$config_dir"; fi
-	if gcm_has_category "$categories" lan || gcm_has_category "$categories" dhcp || gcm_has_category "$categories" dns; then gcm_capture_portable_lan_dhcp_dns "$config_dir"; fi
-	if gcm_has_category "$categories" firewall; then gcm_capture_portable_firewall "$config_dir"; fi
+	if gcm_has_category "$categories" wifi; then
+		gcm_category_log DEBUG wifi start 'msg=Wi-Fi collection started'
+		if ! gcm_capture_portable_wifi "$config_dir"; then gcm_category_log ERROR wifi failed 'result=failed' 'msg=Wi-Fi collection failed'; return 1; fi
+		gcm_category_log INFO wifi complete "radios=$(gcm_uci_type_count wireless wifi-device)" "interfaces=$(gcm_uci_type_count wireless wifi-iface)" 'result=success'
+	else gcm_category_log INFO wifi skipped 'reason=not-selected'; fi
+	if gcm_has_category "$categories" lan || gcm_has_category "$categories" dhcp || gcm_has_category "$categories" dns; then
+		gcm_category_log DEBUG network-services start 'msg=LAN, DHCP, and DNS collection started'
+		if ! gcm_capture_portable_lan_dhcp_dns "$config_dir"; then gcm_category_log ERROR network-services failed 'result=failed'; return 1; fi
+		gcm_has_category "$categories" lan && gcm_category_log INFO lan complete 'result=success'
+		gcm_has_category "$categories" dhcp && gcm_category_log INFO dhcp complete "reservations=$(gcm_uci_type_count dhcp host)" 'result=success'
+		gcm_has_category "$categories" dns && gcm_category_log INFO dns complete "dnsmasq_sections=$(gcm_uci_type_count dhcp dnsmasq)" 'result=success'
+	fi
+	if gcm_has_category "$categories" firewall; then
+		gcm_category_log DEBUG firewall start 'msg=Firewall collection started'
+		if ! gcm_capture_portable_firewall "$config_dir"; then gcm_category_log ERROR firewall failed 'result=failed'; return 1; fi
+		gcm_category_log INFO firewall complete "rules=$(gcm_uci_type_count firewall rule)" "redirects=$(gcm_uci_type_count firewall redirect)" 'result=success'
+	else gcm_category_log INFO firewall skipped 'reason=not-selected'; fi
 	if gcm_has_category "$categories" timezone; then
+		gcm_category_log DEBUG timezone start 'msg=Timezone collection started'
 		gcm_portable_add "$config_dir" timezone \
 			zonename "$(gcm_uci_get system.@system[0].zonename)" timezone "$(gcm_uci_get system.@system[0].timezone)"
-	fi
-	if gcm_has_category "$categories" ddns; then gcm_capture_portable_ddns "$config_dir"; fi
+		gcm_category_log INFO timezone complete 'result=success'
+	else gcm_category_log INFO timezone skipped 'reason=not-selected'; fi
+	if gcm_has_category "$categories" ddns; then
+		gcm_category_log DEBUG ddns start 'msg=DDNS collection started'
+		if ! gcm_capture_portable_ddns "$config_dir"; then gcm_category_log ERROR ddns failed 'result=failed'; return 1; fi
+		gcm_category_log INFO ddns complete 'result=success' 'msg=Device-bound identity remains protected'
+	else gcm_category_log INFO ddns skipped 'reason=not-selected'; fi
 	if gcm_has_category "$categories" vpn; then
+		gcm_category_log DEBUG vpn start 'msg=VPN structural collection started'
 		gcm_vpn_packages | while IFS= read -r package; do
 			gcm_save_uci_export "$package" "$config_dir/vpn/$package"
 			gcm_sanitize_file "$config_dir/vpn/$package"
@@ -731,8 +940,10 @@ gcm_capture_portable() {
 				*openvpn*|ovpn*) gcm_remove_uci_options "$config_dir/vpn/$package" 'username password auth_user_pass private_key key cert ca tls_auth tls_crypt secret token' ;;
 			esac
 		done
-		gcm_capture_portable_network_vpn "$config_dir/vpn" || return 1
-	fi
+		gcm_capture_portable_network_vpn "$config_dir/vpn" || { gcm_category_log ERROR vpn failed 'result=failed'; return 1; }
+		vpn_packages=$(find "$config_dir/vpn" -type f 2>/dev/null | wc -l | tr -d ' ')
+		gcm_category_log INFO vpn complete "packages=$vpn_packages" 'result=success' 'msg=Private identity omitted'
+	else gcm_category_log INFO vpn skipped 'reason=not-selected'; fi
 	uci -c "$config_dir" commit profile 2>/dev/null || true
 	printf '%s\n' "$(gcm_platform_adapter)" > "$config_dir/source-adapter.txt"
 }
@@ -770,6 +981,7 @@ gcm_capture_raw_uci() {
 	sanitized=$5
 	destination="$prefix_dir/uci"
 	mkdir -p "$destination"
+	gcm_diag DEBUG "action=${GCM_ACTION:-create}" 'stage=collect' "strategy=$strategy" 'category=uci' 'msg=Raw UCI collection started'
 	for source in /etc/config/*; do
 		[ -f "$source" ] && [ ! -L "$source" ] || continue
 		package=${source##*/}
@@ -780,6 +992,7 @@ gcm_capture_raw_uci() {
 			continue
 		fi
 		cp -p "$source" "$destination/$package" || return 1
+		gcm_diag TRACE "action=${GCM_ACTION:-create}" 'stage=collect' 'category=uci' "uci_package=$package" 'result=collected' 'msg=UCI values omitted from log'
 		case "$strategy" in
 			clone|remote-safe)
 				gcm_sanitize_file "$destination/$package"
@@ -793,6 +1006,8 @@ gcm_capture_raw_uci() {
 				;;
 		esac
 	done
+	raw_count=$(find "$destination" -type f 2>/dev/null | wc -l | tr -d ' ')
+	gcm_diag INFO "action=${GCM_ACTION:-create}" 'stage=complete' 'category=uci' "packages=$raw_count" "strategy=$strategy" 'result=success'
 }
 
 gcm_discover_keep_files() {
@@ -941,19 +1156,24 @@ gcm_write_manifest() {
 }
 
 gcm_create() {
-	output=$1
-	strategy=$2
-	profile_id=$3
-	name=$4
-	notes=$5
-	categories=$6
-	scripts_input=$7
-	binaries_input=$8
-	gcm_valid_strategy "$strategy" || { gcm_die 'Invalid backup strategy.'; return 1; }
-	categories=$(gcm_valid_categories "$categories") || { gcm_die 'Invalid or empty category selection.'; return 1; }
-	gcm_valid_uuid "$profile_id" || { gcm_die 'Invalid profile UUID.'; return 1; }
+	create_output=$1
+	create_strategy=$2
+	create_profile_id=$3
+	create_name=$4
+	create_notes=$5
+	create_categories=$6
+	create_scripts_input=$7
+	create_binaries_input=$8
+	[ "${GCM_ACTION:-}" = create ] || gcm_prepare_operation create
+	previous_component=$GCM_COMPONENT
+	GCM_COMPONENT=backup
+	create_started=$(date +%s 2>/dev/null || printf 0)
+	gcm_diag INFO 'action=create' 'stage=request' "strategy=$create_strategy" "categories=$create_categories" "archive=$create_output" "profile_uuid=$create_profile_id" "profile_name=$create_name" 'msg=Backup requested'
+	gcm_valid_strategy "$create_strategy" || { gcm_die 'Invalid backup strategy.'; return 1; }
+	create_categories=$(gcm_valid_categories "$create_categories") || { gcm_die 'Invalid or empty category selection.'; return 1; }
+	gcm_valid_uuid "$create_profile_id" || { gcm_die 'Invalid profile UUID.'; return 1; }
 	gcm_have sha256sum || { gcm_die 'sha256sum is required for v2 archives.'; return 1; }
-	if [ "$strategy" = snapshot ]; then
+	if [ "$create_strategy" = snapshot ]; then
 		fingerprint=$(gcm_device_fingerprint) || { gcm_die 'Could not generate the Device Snapshot fingerprint.'; return 1; }
 		[ -n "$fingerprint" ] && [ "$fingerprint" != unavailable ] || {
 			gcm_die 'Device Snapshot requires a stable factory serial number or factory MAC address; neither was detected.'
@@ -961,35 +1181,57 @@ gcm_create() {
 		}
 	fi
 	work=$(mktemp -d /tmp/gcm-create.XXXXXX) || return 1
+	gcm_diag DEBUG 'action=create' 'stage=temporary-directory' "temporary_path=$work" 'result=success' 'msg=Backup workspace created'
 	prefix_dir="$work/$GCM_PREFIX"
 	excluded="$work/excluded"
 	sanitized="$work/sanitized"
 	discovered="$work/discovered"
 	: > "$excluded"; : > "$sanitized"
 	mkdir -p "$prefix_dir/extra" "$prefix_dir/artifacts" "$prefix_dir/source"
+	gcm_diag INFO 'action=create' 'stage=start' "strategy=$create_strategy" "source_model=$(gcm_source_model)" "board_name=$(gcm_board_name)" "firmware=$(gcm_firmware_version)" "architecture=$(gcm_architecture)" "hostname=$(gcm_uci_get system.@system[0].hostname)" 'msg=Backup collection started'
 	gcm_discover_keep_files "$discovered" || { rm -rf "$work"; return 1; }
-	case "$strategy" in
-		portable) gcm_capture_portable "$prefix_dir" "$categories" || { rm -rf "$work"; return 1; } ;;
-		clone|remote-safe|snapshot) gcm_capture_raw_uci "$prefix_dir" "$strategy" "$categories" "$excluded" "$sanitized" || { rm -rf "$work"; return 1; } ;;
+	case "$create_strategy" in
+		portable) gcm_capture_portable "$prefix_dir" "$create_categories" || { gcm_diag ERROR 'action=create' 'stage=collect' 'result=failed' 'msg=Portable collection failed'; rm -rf "$work"; return 1; } ;;
+		clone|remote-safe|snapshot) gcm_capture_raw_uci "$prefix_dir" "$create_strategy" "$create_categories" "$excluded" "$sanitized" || { gcm_diag ERROR 'action=create' 'stage=collect' 'result=failed' 'msg=Raw UCI collection failed'; rm -rf "$work"; return 1; } ;;
 	esac
-	gcm_capture_persistent "$prefix_dir" "$strategy" "$discovered" "$excluded" || { rm -rf "$work"; return 1; }
-	if gcm_has_category "$categories" packages; then
+	gcm_category_log DEBUG persistent start "discovered=$(wc -l < "$discovered" | tr -d ' ')" 'msg=Persistent file collection started'
+	gcm_capture_persistent "$prefix_dir" "$create_strategy" "$discovered" "$excluded" || { gcm_category_log ERROR persistent failed 'result=failed'; rm -rf "$work"; return 1; }
+	persistent_count=$(find "$prefix_dir/extra" -type f 2>/dev/null | wc -l | tr -d ' ')
+	if gcm_has_category "$create_categories" persistent; then gcm_category_log INFO persistent complete "files=$persistent_count" 'result=success'; else gcm_category_log INFO persistent skipped 'reason=not-selected-or-portable'; fi
+	if gcm_has_category "$create_categories" packages; then
+		gcm_category_log DEBUG packages start 'msg=Installed package inventory started'
 		gcm_package_status_tsv /usr/lib/opkg/status > "$prefix_dir/source/packages.tsv"
 		gcm_packages_json "$prefix_dir/packages.json" "$prefix_dir/source/packages.tsv"
+		package_count=$(awk -F '\t' '$8=="true"{count++} END{print count+0}' "$prefix_dir/source/packages.tsv")
+		gcm_category_log INFO packages complete "user_installed=$package_count" 'result=success'
 	else
 		printf '{"source_kernel":"%s","packages":[]}\n' "$(gcm_json_escape "$(uname -r 2>/dev/null || printf unknown)")" > "$prefix_dir/packages.json"
+		gcm_category_log INFO packages skipped 'reason=not-selected'
 	fi
-	gcm_capture_custom "$prefix_dir" "$scripts_input" "$binaries_input" "$work" || { rm -rf "$work"; return 1; }
+	gcm_category_log DEBUG custom-files start 'msg=Explicit custom artifact collection started'
+	gcm_capture_custom "$prefix_dir" "$create_scripts_input" "$create_binaries_input" "$work" || { gcm_category_log ERROR custom-files failed 'result=failed'; rm -rf "$work"; return 1; }
+	custom_files=$(wc -l < "$work/scripts.list" 2>/dev/null | tr -d ' ' || printf 0)
+	custom_binaries=$(wc -l < "$work/binaries.list" 2>/dev/null | tr -d ' ' || printf 0)
+	gcm_category_log INFO custom-files complete "collected=$custom_files" 'result=success'
+	gcm_category_log INFO custom-binaries complete "collected=$custom_binaries" 'result=success'
 	gcm_facts_json > "$prefix_dir/source/facts.json"
-	gcm_write_manifest "$prefix_dir" "$strategy" "$profile_id" "$name" "$notes" "$categories" "$excluded" "$sanitized" "$discovered"
+	gcm_diag DEBUG 'action=create' 'stage=manifest' "profile_uuid=$create_profile_id" "strategy=$create_strategy" 'msg=Manifest creation started'
+	gcm_write_manifest "$prefix_dir" "$create_strategy" "$create_profile_id" "$create_name" "$create_notes" "$create_categories" "$excluded" "$sanitized" "$discovered"
+	gcm_diag INFO 'action=create' 'stage=manifest' "profile_uuid=$create_profile_id" "strategy=$create_strategy" 'result=success' 'msg=Manifest created'
 	gcm_generate_checksums "$work" || { rm -rf "$work"; return 1; }
-	mkdir -p "$(dirname "$output")" || { rm -rf "$work"; return 1; }
+	mkdir -p "$(dirname "$create_output")" || { rm -rf "$work"; return 1; }
 	umask 077
-	tar -C "$work" -czf "$output" "$GCM_PREFIX" || { rm -f "$output"; rm -rf "$work"; gcm_die 'Could not create archive.'; return 1; }
+	gcm_diag DEBUG 'action=create' 'stage=archive' "archive=$create_output" 'msg=Archive compression started'
+	tar -C "$work" -czf "$create_output" "$GCM_PREFIX" || { rm -f "$create_output"; rm -rf "$work"; gcm_die 'Could not create archive.'; return 1; }
+	payload_size=$(du -sk "$prefix_dir" 2>/dev/null | awk '{print $1 * 1024}' || printf unknown)
+	archive_size=$(wc -c < "$create_output" 2>/dev/null | tr -d ' ' || printf unknown)
+	archive_sha256=$(sha256sum "$create_output" 2>/dev/null | awk '{print $1}' || printf unavailable)
 	rm -rf "$work"
-	gcm_log "CREATED=$output"
-	gcm_log "PROFILE_UUID=$profile_id"
-	gcm_log "STRATEGY=$strategy"
+	gcm_diag INFO 'action=create' 'stage=complete' "strategy=$create_strategy" "archive=$create_output" "payload_size=$payload_size" "archive_size=$archive_size" "sha256=$archive_sha256" "elapsed_seconds=$(gcm_elapsed "$create_started")" 'result=success' 'msg=Backup archive created'
+	gcm_log "CREATED=$create_output"
+	gcm_log "PROFILE_UUID=$create_profile_id"
+	gcm_log "STRATEGY=$create_strategy"
+	GCM_COMPONENT=$previous_component
 }
 
 gcm_legacy_metadata() {
@@ -1006,6 +1248,11 @@ gcm_legacy_metadata() {
 gcm_inspect() {
 	archive=$1
 	format=${2:-json}
+	[ "${GCM_ACTION:-}" = inspect ] || gcm_prepare_operation inspect
+	previous_component=$GCM_COMPONENT; GCM_COMPONENT=archive
+	inspect_started=$(date +%s 2>/dev/null || printf 0)
+	archive_size=$(gcm_file_size "$archive")
+	gcm_diag INFO 'action=inspect' 'stage=start' "archive=$archive" "archive_size=$archive_size" "output_format=$format" 'msg=Archive inspection started'
 	work=$(mktemp -d /tmp/gcm-inspect.XXXXXX) || return 1
 	kind=$(gcm_extract_archive "$archive" "$work") || { rm -rf "$work"; return 1; }
 	case "$kind" in
@@ -1013,6 +1260,12 @@ gcm_inspect() {
 			prefix_dir="$work/$GCM_PREFIX"
 			gcm_verify_checksums "$prefix_dir" || { rm -rf "$work"; return 1; }
 			gcm_validate_v2_manifest "$prefix_dir/manifest.json" || { rm -rf "$work"; return 1; }
+			manifest_version=$(gcm_manifest_field "$prefix_dir/manifest.json" format_version)
+			profile_id=$(gcm_manifest_field "$prefix_dir/manifest.json" profile_uuid)
+			strategy=$(gcm_manifest_field "$prefix_dir/manifest.json" backup_strategy)
+			member_count=$(find "$prefix_dir" -type f 2>/dev/null | wc -l | tr -d ' ')
+			checksum_count=$(wc -l < "$prefix_dir/checksums.sha256" 2>/dev/null | tr -d ' ' || printf 0)
+			gcm_diag INFO 'action=inspect' 'stage=metadata' "archive_type=$kind" "member_count=$member_count" "checksum_count=$checksum_count" "manifest_version=$manifest_version" "profile_uuid=$profile_id" "strategy=$strategy" 'result=success'
 			if [ "$format" = json ]; then
 				cat "$prefix_dir/manifest.json"
 			else
@@ -1024,6 +1277,8 @@ gcm_inspect() {
 			;;
 	esac
 	rm -rf "$work"
+	gcm_diag INFO 'action=inspect' 'stage=complete' "archive_type=$kind" "elapsed_seconds=$(gcm_elapsed "$inspect_started")" 'result=success' 'msg=Archive inspection completed'
+	GCM_COMPONENT=$previous_component
 }
 
 gcm_add_result() { printf '%s\n' "$2" >> "$1"; }
@@ -1055,13 +1310,21 @@ gcm_package_review_files() {
 	gcm_package_status_tsv /usr/lib/opkg/status > "$target"
 	feed="$work/feed-packages"
 	supported_arches=$(gcm_supported_package_arches | tr '\n' ' ')
+	gcm_diag INFO "action=${GCM_ACTION:-packages}" 'stage=architecture' "supported_architectures=$supported_arches" 'msg=Target package architectures detected'
 	feed_ok=1
-	if gcm_opkg_run list > "$feed" 2>/dev/null; then :; else feed_ok=0; : > "$feed"; fi
+	package_feed_started=$(date +%s 2>/dev/null || printf 0)
+	if gcm_opkg_run list > "$feed" 2>/dev/null; then
+		gcm_diag DEBUG "action=${GCM_ACTION:-packages}" 'stage=feed-list' "elapsed_seconds=$(gcm_elapsed "$package_feed_started")" 'result=success'
+	else
+		feed_ok=0; : > "$feed"
+		gcm_diag WARN "action=${GCM_ACTION:-packages}" 'stage=feed-list' "elapsed_seconds=$(gcm_elapsed "$package_feed_started")" 'result=failed' 'reason=feed-unreachable-or-uncached'
+	fi
 	while IFS="$(printf '\t')" read -r name version arch section description depends size user kmod || [ -n "${name:-}" ]; do
 		[ -n "$name" ] || continue
 		[ "$user" = true ] || continue
 		if [ "$kmod" = true ] || [ "$section" = kernel ]; then
 			gcm_add_result "$work/pkg-kmod" "$name $version (source kernel $source_kernel)"
+			gcm_diag DEBUG "action=${GCM_ACTION:-packages}" 'stage=classify' "package=$name" "source_architecture=$arch" 'classification=kmod' 'result=excluded'
 			continue
 		fi
 		target_line=$(awk -F '\t' -v p="$name" '$1==p{print;exit}' "$target")
@@ -1069,16 +1332,21 @@ gcm_package_review_files() {
 			target_version=$(printf '%s\n' "$target_line" | awk -F '\t' '{print $2}')
 			if [ "$target_version" = "$version" ]; then
 				gcm_add_result "$work/pkg-same" "$name $version"
+				gcm_diag DEBUG "action=${GCM_ACTION:-packages}" 'stage=classify' "package=$name" 'classification=already-installed' 'result=skipped'
 			else
 				gcm_add_result "$work/pkg-different" "$name source=$version target=$target_version"
+				gcm_diag DEBUG "action=${GCM_ACTION:-packages}" 'stage=classify' "package=$name" 'classification=different-version' 'result=review'
 			fi
 		elif ! gcm_package_arch_compatible "$arch" "$supported_arches"; then
 			gcm_add_result "$work/pkg-unavailable" "$name $version (source architecture $arch is unsupported by target)"
+			gcm_diag WARN "action=${GCM_ACTION:-packages}" 'stage=classify' "package=$name" "source_architecture=$arch" 'classification=incompatible-architecture' 'result=excluded'
 		elif awk -F ' - ' -v package="$name" '$1==package{found=1;exit} END{exit found?0:1}' "$feed" 2>/dev/null; then
 			feed_version=$(awk -F ' - ' -v package="$name" '$1==package{print $2;exit}' "$feed")
 			gcm_add_result "$work/pkg-available" "$name source=$version feed=$feed_version"
+			gcm_diag DEBUG "action=${GCM_ACTION:-packages}" 'stage=classify' "package=$name" 'classification=available' 'result=selectable'
 		else
 			gcm_add_result "$work/pkg-unavailable" "$name $version"
+			gcm_diag WARN "action=${GCM_ACTION:-packages}" 'stage=classify' "package=$name" 'classification=unavailable' 'result=excluded'
 		fi
 	done < "$source_tsv"
 	printf '%s\n' "$feed_ok" > "$work/feed-ok"
@@ -1099,6 +1367,10 @@ gcm_package_class() {
 
 gcm_packages_review() {
 	archive=$1
+	[ "${GCM_ACTION:-}" = packages ] || gcm_prepare_operation packages
+	previous_component=$GCM_COMPONENT; GCM_COMPONENT=packages
+	package_review_started=$(date +%s 2>/dev/null || printf 0)
+	gcm_diag INFO 'action=packages' 'stage=start' "archive=$archive" 'msg=Package Review started'
 	work=$(mktemp -d /tmp/gcm-packages.XXXXXX) || return 1
 	kind=$(gcm_extract_archive "$archive" "$work/archive") || { rm -rf "$work"; return 1; }
 	[ "$kind" = v2 ] || { rm -rf "$work"; gcm_die 'Package Review requires a v2 archive.'; return 1; }
@@ -1116,13 +1388,19 @@ gcm_packages_review() {
 	printf ',"missing_unavailable":'; gcm_json_array_file "$work/pkg-unavailable"
 	printf ',"kernel_packages":'; gcm_json_array_file "$work/pkg-kmod"
 	printf '}\n'
+	gcm_diag INFO 'action=packages' 'stage=complete' "available=$(wc -l < "$work/pkg-available" | tr -d ' ')" "unavailable=$(wc -l < "$work/pkg-unavailable" | tr -d ' ')" "kmods=$(wc -l < "$work/pkg-kmod" | tr -d ' ')" "elapsed_seconds=$(gcm_elapsed "$package_review_started")" 'result=success' 'msg=Package Review completed'
 	rm -rf "$work"
+	GCM_COMPONENT=$previous_component
 }
 
 gcm_validate() {
 	archive=$1
 	categories=${2:-wifi,lan,dhcp,dns,firewall,timezone,ddns,vpn,packages,persistent,custom-files,custom-binaries}
 	dangerous_override=${3:-0}
+	[ "${GCM_ACTION:-}" = validate ] || gcm_prepare_operation validate
+	previous_component=$GCM_COMPONENT; GCM_COMPONENT=validation
+	validate_started=$(date +%s 2>/dev/null || printf 0)
+	gcm_diag INFO 'action=validate' 'stage=start' "archive=$archive" "categories=$categories" "dangerous_override=$dangerous_override" 'msg=Archive validation started'
 	categories=$(gcm_valid_categories "$categories") || { gcm_die 'Invalid validation categories.'; return 1; }
 	work=$(mktemp -d /tmp/gcm-validate.XXXXXX) || return 1
 	kind=$(gcm_extract_archive "$archive" "$work/archive") || { rm -rf "$work"; return 1; }
@@ -1164,6 +1442,7 @@ gcm_validate() {
 	target_arch=$(gcm_architecture)
 	target_kernel=$(uname -r 2>/dev/null || printf unknown)
 	target_fingerprint=$(gcm_device_fingerprint)
+	gcm_diag INFO 'action=validate' 'stage=source-target' "strategy=$strategy" "source_model=$source_model" "source_board=$source_id" "source_firmware=$source_firmware" "source_architecture=$source_arch" "target_model=$target_model" "target_board=$target_id" "target_firmware=$target_firmware" "target_architecture=$target_arch" 'msg=Source and target metadata collected'
 	case "$strategy" in
 		clone|remote-safe)
 			if [ -n "$source_id" ] && [ "$source_id" != unknown ] && [ -n "$target_id" ] && [ "$target_id" != unknown ]; then
@@ -1277,7 +1556,10 @@ gcm_validate() {
 	printf ',"warnings":'; gcm_json_array_file "$warn"
 	printf ',"dangerous_actions":'; gcm_json_array_file "$dangerous"
 	printf '}\n'
+	if [ "$compatible" = true ]; then validation_result=pass; validation_severity=INFO; else validation_result=failed; validation_severity=ERROR; fi
+	gcm_diag "$validation_severity" 'action=validate' 'stage=source-target-compatibility' "strategy=$strategy" "result=$validation_result" "elapsed_seconds=$(gcm_elapsed "$validate_started")" 'msg=Validation completed'
 	rm -rf "$work"
+	GCM_COMPONENT=$previous_component
 }
 
 gcm_profile_sections() {
@@ -1319,7 +1601,11 @@ gcm_apply_portable_wifi() {
 		band=$(gcm_profile_get "$config_dir" "$source" band)
 		role=$(gcm_profile_get "$config_dir" "$source" role)
 		radio=$(gcm_target_radio_for_band "$band" | sed -n '1p')
-		if [ -z "$radio" ]; then gcm_log "SKIPPED=wifi:$band:no-target-radio"; continue; fi
+		if [ -z "$radio" ]; then
+			gcm_diag INFO 'action=restore' 'stage=apply' 'category=wifi' "source_band=$band" 'result=skipped' 'reason=no-target-radio'
+			gcm_log "SKIPPED=wifi:$band:no-target-radio"; continue
+		fi
+		gcm_diag DEBUG 'action=restore' 'stage=adapt' 'category=wifi' "source_band=$band" "target_radio=$radio" "role=$role" 'action_name=adapt' 'msg=Portable Wi-Fi radio mapped by capability'
 		iface=$(gcm_target_wifi_iface "$radio" "$role" | sed -n '1p')
 		if [ -z "$iface" ]; then
 			iface=$(uci add wireless wifi-iface)
@@ -1328,7 +1614,9 @@ gcm_apply_portable_wifi() {
 			# Do not invent a missing target network. A guest SSID can be added
 			# only when a logical guest interface already exists.
 			if ! uci -q get "network.$target_network" >/dev/null 2>&1; then
-				uci delete "wireless.$iface"; gcm_log "SKIPPED=wifi:$band:$role:missing-$target_network-network"; continue
+				uci delete "wireless.$iface"
+				gcm_diag INFO 'action=restore' 'stage=apply' 'category=wifi' "source_band=$band" "role=$role" 'result=skipped' "reason=missing-$target_network-network"
+				gcm_log "SKIPPED=wifi:$band:$role:missing-$target_network-network"; continue
 			fi
 			uci set "wireless.$iface.network=$target_network"
 		fi
@@ -1342,6 +1630,7 @@ gcm_apply_portable_wifi() {
 		enabled=$(gcm_profile_get "$config_dir" "$source" enabled)
 		case "$enabled" in 1|true) uci -q delete "wireless.$iface.disabled" ;; 0|false) uci set "wireless.$iface.disabled=1" ;; esac
 		gcm_log "ADAPTED=wifi:$band:$role:target-$radio"
+		gcm_diag INFO 'action=restore' 'stage=apply' 'category=wifi' "source_band=$band" "target_radio=$radio" "target_interface=$iface" "role=$role" 'result=adapted'
 	done
 	gcm_adapter_commit wireless
 }
@@ -1519,10 +1808,11 @@ gcm_prune_rollbacks() {
 	case "$keep" in ''|*[!0-9]*) keep=5 ;; esac
 	[ "$keep" -ge 1 ] 2>/dev/null || keep=1
 	mkdir -p "$rollback_root" || return 1
+	gcm_diag DEBUG "action=${GCM_ACTION:-restore}" 'stage=prune' 'component_name=storage' "rollback_root=$rollback_root" "max_rollbacks=$keep" 'msg=Rollback pruning evaluated'
 	# Keep room for the snapshot about to be created. All candidates are
 	# application-owned UUID directories beneath the fixed rollback root.
 	ls -1dt "$rollback_root"/* 2>/dev/null | awk -v keep="$keep" 'NR>=keep' | while IFS= read -r old; do
-		case "$old" in "$rollback_root"/[A-Fa-f0-9-]*) rm -rf "$old" ;; esac
+		case "$old" in "$rollback_root"/[A-Fa-f0-9-]*) gcm_diag INFO "action=${GCM_ACTION:-restore}" 'stage=prune' 'component_name=storage' "path=$old" 'result=removed'; rm -rf "$old" ;; esac
 	done
 }
 
@@ -1530,6 +1820,9 @@ gcm_pre_restore_snapshot() {
 	profile_id=$1
 	prefix_dir=${2:-}
 	direct_custom=${3:-0}
+	previous_component=$GCM_COMPONENT; GCM_COMPONENT=rollback
+	snapshot_started=$(date +%s 2>/dev/null || printf 0)
+	gcm_diag INFO 'action=restore' 'stage=snapshot-start' "profile_uuid=$profile_id" "direct_custom_files=$direct_custom" 'msg=Mandatory pre-restore snapshot creation started'
 	gcm_prune_rollbacks || return 1
 	root="/root/glinet-crossmodel/rollback/$profile_id"
 	data="$root/glinet-crossmodel-rollback"
@@ -1556,21 +1849,33 @@ gcm_pre_restore_snapshot() {
 		done
 	fi
 	printf 'created_at=%s\nmodel=%s\nfingerprint=%s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date)" "$(gcm_source_model)" "$(gcm_device_fingerprint)" > "$data/rollback-info.txt"
+	file_count=$(find "$data" -type f 2>/dev/null | wc -l | tr -d ' ')
+	gcm_diag DEBUG 'action=restore' 'stage=snapshot-checksums' "snapshot_path=$root" "files=$file_count" 'msg=Rollback checksum generation started'
 	(cd "$root" && find glinet-crossmodel-rollback -type f ! -name checksums.sha256 | sort | while IFS= read -r path; do sha256sum "$path"; done > glinet-crossmodel-rollback/checksums.sha256) || return 1
 	tar -C "$root" -czf "$root/pre-restore.tar.gz" glinet-crossmodel-rollback || return 1
+	snapshot_size=$(wc -c < "$root/pre-restore.tar.gz" 2>/dev/null | tr -d ' ' || printf unknown)
+	gcm_diag INFO 'action=restore' 'stage=snapshot-complete' "snapshot_path=$root/pre-restore.tar.gz" "files=$file_count" "archive_size=$snapshot_size" "elapsed_seconds=$(gcm_elapsed "$snapshot_started")" 'result=success' 'msg=Pre-restore snapshot created'
+	GCM_COMPONENT=$previous_component
 	printf '%s\n' "$root"
 }
 
 gcm_rollback_snapshot() {
 	root=$1
+	previous_component=$GCM_COMPONENT; GCM_COMPONENT=rollback
+	rollback_started=$(date +%s 2>/dev/null || printf 0)
+	gcm_diag WARN 'action=rollback' 'stage=start' "snapshot_path=$root" 'msg=Rollback started after restore failure'
 	data="$root/glinet-crossmodel-rollback/etc/config"
-	[ -d "$data" ] || { gcm_log 'ROLLBACK=failed:snapshot-missing'; return 1; }
+	[ -d "$data" ] || { gcm_diag ERROR 'action=rollback' 'stage=locate' 'result=failed' 'reason=snapshot-missing'; gcm_log 'ROLLBACK=failed:snapshot-missing'; return 1; }
 	checksums="$root/glinet-crossmodel-rollback/checksums.sha256"
-	[ -s "$checksums" ] && (cd "$root" && sha256sum -c glinet-crossmodel-rollback/checksums.sha256 >/dev/null 2>&1) || { gcm_log 'ROLLBACK=failed:snapshot-integrity'; return 1; }
+	[ -s "$checksums" ] && (cd "$root" && sha256sum -c glinet-crossmodel-rollback/checksums.sha256 >/dev/null 2>&1) || { gcm_diag ERROR 'action=rollback' 'stage=checksum-verification' 'result=failed' 'reason=snapshot-integrity'; gcm_log 'ROLLBACK=failed:snapshot-integrity'; return 1; }
+	gcm_diag DEBUG 'action=rollback' 'stage=checksum-verification' 'result=pass'
 	result=0
+	files_restored=0
 	for source in "$data"/*; do
 		[ -f "$source" ] || continue
-		cp -p "$source" "/etc/config/${source##*/}" || result=1
+		rollback_package=${source##*/}
+		gcm_diag TRACE 'action=rollback' 'stage=uci-restore' "uci_package=$rollback_package" 'action_name=replace' 'msg=Restoring UCI package from snapshot'
+		if cp -p "$source" "/etc/config/$rollback_package"; then files_restored=$((files_restored + 1)); else result=1; gcm_diag ERROR 'action=rollback' 'stage=uci-restore' "uci_package=$rollback_package" 'result=failed'; fi
 	done
 	if [ -d "$root/glinet-crossmodel-rollback/root" ]; then
 		find "$root/glinet-crossmodel-rollback/root" -type f | while IFS= read -r source; do
@@ -1580,7 +1885,7 @@ gcm_rollback_snapshot() {
 		done || result=1
 	fi
 	if [ -f "$root/glinet-crossmodel-rollback/created-paths.txt" ]; then
-		while IFS= read -r target || [ -n "$target" ]; do [ -n "$target" ] && gcm_safe_absolute_path "$target" >/dev/null && rm -f "$target"; done < "$root/glinet-crossmodel-rollback/created-paths.txt"
+		while IFS= read -r target || [ -n "$target" ]; do [ -n "$target" ] && gcm_safe_absolute_path "$target" >/dev/null && { rm -f "$target"; gcm_diag TRACE 'action=rollback' 'stage=remove-created-paths' "path=$target" 'result=removed'; }; done < "$root/glinet-crossmodel-rollback/created-paths.txt"
 	fi
 	for source in "$data"/*; do
 		[ -f "$source" ] || continue
@@ -1595,8 +1900,12 @@ gcm_rollback_snapshot() {
 	if [ -f "$root/glinet-crossmodel-rollback/created-paths.txt" ]; then
 		while IFS= read -r target || [ -n "$target" ]; do [ -n "$target" ] && [ ! -e "$target" ] || result=1; done < "$root/glinet-crossmodel-rollback/created-paths.txt"
 	fi
-	if [ "$result" -eq 0 ]; then gcm_log 'ROLLBACK=verified:all-snapshot-files-restored'; return 0; fi
-	gcm_log 'ROLLBACK=failed:verification-mismatch'; return 1
+	if [ "$result" -eq 0 ]; then
+		gcm_diag INFO 'action=rollback' 'stage=verification' "files_restored=$files_restored" "elapsed_seconds=$(gcm_elapsed "$rollback_started")" 'result=success' 'msg=Rollback verified'
+		gcm_log 'ROLLBACK=verified:all-snapshot-files-restored'; GCM_COMPONENT=$previous_component; return 0
+	fi
+	gcm_diag ERROR 'action=rollback' 'stage=verification' "files_restored=$files_restored" "elapsed_seconds=$(gcm_elapsed "$rollback_started")" 'result=failed' 'reason=verification-mismatch'
+	gcm_log 'ROLLBACK=failed:verification-mismatch'; GCM_COMPONENT=$previous_component; return 1
 }
 
 gcm_apply_raw_uci() {
@@ -1610,12 +1919,15 @@ gcm_apply_raw_uci() {
 		case "$package" in network|firewall|wireless) continue ;; esac
 		if [ "$strategy" = snapshot ]; then
 			cp -p "$source" "/etc/config/$package" || return 1
+			gcm_diag DEBUG 'action=restore' 'stage=commit' "uci_package=$package" 'action_name=replace-snapshot' 'result=success'
 		else
 			identity=$(mktemp /tmp/gcm-raw-identity.XXXXXX) || return 1
 			gcm_target_identity_assignments "$package" "$identity"
 			cp -p "$source" "/etc/config/$package" || { rm -f "$identity"; return 1; }
 			gcm_reapply_target_identity "$identity" || { rm -f "$identity"; return 1; }
-			uci commit "$package" || { rm -f "$identity"; return 1; }
+			if uci commit "$package"; then
+				gcm_diag DEBUG 'action=restore' 'stage=commit' "uci_package=$package" 'action_name=commit' 'result=success'
+			else status=$?; gcm_diag ERROR 'action=restore' 'stage=commit' "uci_package=$package" "exit_code=$status" 'result=failed'; rm -f "$identity"; return 1; fi
 			rm -f "$identity"
 		fi
 		gcm_log "APPLIED=uci:$package"
@@ -1629,6 +1941,7 @@ gcm_apply_raw_uci() {
 			mkdir -p "$pending" || return 1
 			cp -p "$source" "$pending/$package" || return 1
 			gcm_log "PRESERVED=uci:$package:active-ssh-management-path;source-staged-$pending/$package"
+			gcm_diag INFO 'action=restore' 'stage=apply' "uci_package=$package" 'result=preserved' 'reason=active-ssh-management-path' "staged_path=$pending/$package"
 			continue
 		fi
 		if [ "$strategy" = snapshot ]; then
@@ -1638,7 +1951,9 @@ gcm_apply_raw_uci() {
 			gcm_target_identity_assignments "$package" "$identity"
 			cp -p "$source" "/etc/config/$package" || { rm -f "$identity"; return 1; }
 			gcm_reapply_target_identity "$identity" || { rm -f "$identity"; return 1; }
-			uci commit "$package" || { rm -f "$identity"; return 1; }
+			if uci commit "$package"; then
+				gcm_diag DEBUG 'action=restore' 'stage=commit' "uci_package=$package" 'action_name=commit' 'result=success'
+			else status=$?; gcm_diag ERROR 'action=restore' 'stage=commit' "uci_package=$package" "exit_code=$status" 'result=failed'; rm -f "$identity"; return 1; fi
 			rm -f "$identity"
 		fi
 		gcm_log "APPLIED_LAST=uci:$package"
@@ -1694,22 +2009,38 @@ gcm_install_selected_packages() {
 	source_tsv=$1
 	selected=$2
 	[ -n "$selected" ] || return 0
-	if ! gcm_opkg_run update; then gcm_log 'WARNING=package-feeds-unreachable;restore-continues'; return 0; fi
+	gcm_diag INFO 'action=restore' 'stage=opkg-update' "selected_packages=$selected" 'msg=Package feed update started'
+	opkg_started=$(date +%s 2>/dev/null || printf 0)
+	if gcm_opkg_run update; then
+		gcm_diag INFO 'action=restore' 'stage=opkg-update' "elapsed_seconds=$(gcm_elapsed "$opkg_started")" 'result=success'
+	else
+		status=$?
+		gcm_diag WARN 'action=restore' 'stage=opkg-update' "exit_code=$status" "elapsed_seconds=$(gcm_elapsed "$opkg_started")" 'result=failed' 'reason=package-feeds-unreachable' 'msg=Package installation skipped; configuration restore continues'
+		gcm_log 'WARNING=package-feeds-unreachable;restore-continues'; return 0
+	fi
 	supported_arches=$(gcm_supported_package_arches | tr '\n' ' ')
+	gcm_diag INFO 'action=restore' 'stage=package-architecture' "supported_architectures=$supported_arches" 'msg=Supported target package architectures detected'
 	while [ -n "$selected" ]; do
 		package=${selected%%,*}
 		if [ "$selected" = "$package" ]; then selected=''; else selected=${selected#*,}; fi
-		case "$package" in ''|*[!A-Za-z0-9+._-]*) gcm_log "SKIPPED=package:$package:invalid-name"; continue ;; kmod-*) gcm_log "SKIPPED=package:$package:kernel-module"; continue ;; esac
+		gcm_diag DEBUG 'action=restore' 'stage=package-selection' "package=$package" 'result=selected'
+		case "$package" in ''|*[!A-Za-z0-9+._-]*) gcm_diag WARN 'action=restore' 'stage=package-selection' "package=$package" 'result=skipped' 'reason=invalid-name'; gcm_log "SKIPPED=package:$package:invalid-name"; continue ;; kmod-*) gcm_diag INFO 'action=restore' 'stage=package-selection' "package=$package" 'result=skipped' 'reason=kernel-module'; gcm_log "SKIPPED=package:$package:kernel-module"; continue ;; esac
 		line=$(awk -F '\t' -v p="$package" '$1==p{print;exit}' "$source_tsv")
-		[ -n "$line" ] || { gcm_log "SKIPPED=package:$package:not-in-archive"; continue; }
+		[ -n "$line" ] || { gcm_diag WARN 'action=restore' 'stage=package-selection' "package=$package" 'result=skipped' 'reason=not-in-archive'; gcm_log "SKIPPED=package:$package:not-in-archive"; continue; }
 		is_kmod=$(printf '%s\n' "$line" | awk -F '\t' '{print $9}')
 		is_user=$(printf '%s\n' "$line" | awk -F '\t' '{print $8}')
 		package_arch=$(printf '%s\n' "$line" | awk -F '\t' '{print $3}')
-		[ "$is_user" = true ] || { gcm_log "SKIPPED=package:$package:not-user-installed"; continue; }
-		[ "$is_kmod" != true ] || { gcm_log "SKIPPED=package:$package:kernel-module"; continue; }
-		gcm_package_arch_compatible "$package_arch" "$supported_arches" || { gcm_log "SKIPPED=package:$package:unsupported-architecture-$package_arch"; continue; }
-		if opkg status "$package" 2>/dev/null | grep -q 'Status:.*installed'; then gcm_log "SKIPPED=package:$package:already-installed"; continue; fi
-		if gcm_opkg_run install "$package"; then gcm_log "APPLIED=package:$package"; else gcm_log "SKIPPED=package:$package:unavailable-or-incompatible"; fi
+		[ "$is_user" = true ] || { gcm_diag INFO 'action=restore' 'stage=package-selection' "package=$package" 'result=skipped' 'reason=not-user-installed'; gcm_log "SKIPPED=package:$package:not-user-installed"; continue; }
+		[ "$is_kmod" != true ] || { gcm_diag INFO 'action=restore' 'stage=package-selection' "package=$package" 'result=skipped' 'reason=kernel-module'; gcm_log "SKIPPED=package:$package:kernel-module"; continue; }
+		gcm_package_arch_compatible "$package_arch" "$supported_arches" || { gcm_diag WARN 'action=restore' 'stage=package-selection' "package=$package" "source_architecture=$package_arch" 'result=skipped' 'reason=incompatible-architecture'; gcm_log "SKIPPED=package:$package:unsupported-architecture-$package_arch"; continue; }
+		if opkg status "$package" 2>/dev/null | grep -q 'Status:.*installed'; then gcm_diag INFO 'action=restore' 'stage=package-selection' "package=$package" 'result=skipped' 'reason=already-installed'; gcm_log "SKIPPED=package:$package:already-installed"; continue; fi
+		install_started=$(date +%s 2>/dev/null || printf 0)
+		gcm_diag INFO 'action=restore' 'stage=package-install' "package=$package" "source_architecture=$package_arch" 'msg=Package installation started'
+		if gcm_opkg_run install "$package"; then
+			gcm_diag INFO 'action=restore' 'stage=package-install' "package=$package" "elapsed_seconds=$(gcm_elapsed "$install_started")" 'exit_code=0' 'result=success'; gcm_log "APPLIED=package:$package"
+		else
+			status=$?; gcm_diag WARN 'action=restore' 'stage=package-install' "package=$package" "exit_code=$status" "elapsed_seconds=$(gcm_elapsed "$install_started")" 'result=failed' 'reason=unavailable-or-incompatible'; gcm_log "SKIPPED=package:$package:unavailable-or-incompatible"
+		fi
 	done
 }
 
@@ -1720,10 +2051,19 @@ gcm_restore() {
 	direct_custom=${4:-0}
 	dangerous_override=${5:-0}
 	allow_legacy=${6:-0}
+	[ "${GCM_ACTION:-}" = restore ] || gcm_prepare_operation restore
+	GCM_COMPONENT=restore
+	restore_started=$(date +%s 2>/dev/null || printf 0)
+	gcm_diag INFO 'action=restore' 'stage=request' "archive=$archive" "categories=$categories" "direct_custom_files=$direct_custom" "dangerous_override=$dangerous_override" "allow_legacy=$allow_legacy" "package_selection=$package_selection" 'msg=Restore requested'
 	categories=$(gcm_valid_categories "$categories") || { gcm_die 'Invalid restore categories.'; return 1; }
+	[ -f "$archive" ] || { GCM_STAGE=archive-locate; gcm_die 'Archive is missing.'; return 1; }
+	gcm_diag INFO 'action=restore' 'stage=archive-locate' "archive=$archive" "archive_size=$(gcm_file_size "$archive")" 'result=success' 'msg=Restore archive located'
+	gcm_diag INFO 'action=restore' 'stage=validation' 'msg=Mandatory restore validation started'
 	plan=$(gcm_validate "$archive" "$categories" "$dangerous_override") || return 1
+	GCM_ACTION=restore; GCM_COMPONENT=restore; export GCM_ACTION GCM_COMPONENT
 	if ! printf '%s' "$plan" | grep -q '"compatible":true'; then gcm_die 'Restore blocked by validation incompatibility.'; return 1; fi
 	kind=$(printf '%s' "$plan" | sed -n 's/.*"archive_kind":"\([^"]*\)".*/\1/p')
+	gcm_diag INFO 'action=restore' 'stage=validation' "archive_type=$kind" 'result=pass' 'msg=Mandatory restore validation passed'
 	if [ "$kind" = legacy-v1 ] && [ "$allow_legacy" != 1 ]; then gcm_die 'Legacy restore requires explicit --allow-legacy approval.'; return 1; fi
 	work=$(mktemp -d /tmp/gcm-restore.XXXXXX) || return 1
 	kind=$(gcm_extract_archive "$archive" "$work/archive") || { rm -rf "$work"; return 1; }
@@ -1733,30 +2073,56 @@ gcm_restore() {
 		gcm_verify_checksums "$prefix_dir" || { rm -rf "$work"; return 1; }
 		strategy=$(gcm_manifest_field "$manifest" backup_strategy)
 		profile_id=$(gcm_manifest_field "$manifest" profile_uuid)
+		source_model=$(gcm_manifest_field "$manifest" source_model)
+		source_firmware=$(gcm_manifest_field "$manifest" firmware_version)
+		source_architecture=$(gcm_manifest_field "$manifest" architecture)
 	else
 		prefix_dir="$work/archive/profile"
 		strategy=legacy-portable
 		profile_id="legacy-$(date +%s)-$$"
+		source_model=$(gcm_manifest_field "$prefix_dir/meta.json" model)
+		source_firmware=$(gcm_manifest_field "$prefix_dir/meta.json" firmware)
+		source_architecture=$(gcm_manifest_field "$prefix_dir/meta.json" architecture)
 	fi
+	gcm_diag INFO 'action=restore' 'stage=metadata' "archive_type=$kind" "strategy=$strategy" "profile_uuid=$profile_id" "source_model=$source_model" "source_firmware=$source_firmware" "source_architecture=$source_architecture" "target_model=$(gcm_source_model)" "target_firmware=$(gcm_firmware_version)" "target_architecture=$(gcm_architecture)" 'msg=Restore metadata confirmed'
 	snapshot=$(gcm_pre_restore_snapshot "$profile_id" "$prefix_dir" "$direct_custom") || { rm -rf "$work"; gcm_die 'Could not create the mandatory pre-restore snapshot.'; return 1; }
 	gcm_log "PRE_RESTORE_SNAPSHOT=$snapshot/pre-restore.tar.gz"
+	gcm_diag INFO 'action=restore' 'stage=apply-start' "strategy=$strategy" "snapshot_path=$snapshot/pre-restore.tar.gz" 'msg=Beginning restore apply phase'
 	apply_ok=1
 	case "$strategy" in
 		portable)
 			config_dir="$prefix_dir/portable"
-			if gcm_has_category "$categories" wifi; then gcm_apply_portable_wifi "$config_dir" || apply_ok=0; fi
-			gcm_apply_portable_lan_dhcp_dns "$config_dir" "$categories" || apply_ok=0
-			if gcm_has_category "$categories" firewall; then gcm_apply_portable_firewall "$config_dir" || apply_ok=0; fi
+			if gcm_has_category "$categories" wifi; then
+				gcm_category_log INFO wifi start 'msg=Portable Wi-Fi apply started'
+				if gcm_apply_portable_wifi "$config_dir"; then gcm_category_log INFO wifi complete 'result=success'; else apply_ok=0; gcm_category_log ERROR wifi failed 'result=failed'; fi
+			else gcm_category_log INFO wifi skipped 'reason=not-selected'; fi
+			gcm_category_log INFO network-services start 'msg=Portable LAN/DHCP/DNS apply started'
+			if gcm_apply_portable_lan_dhcp_dns "$config_dir" "$categories"; then gcm_category_log INFO network-services complete 'result=success'; else apply_ok=0; gcm_category_log ERROR network-services failed 'result=failed'; fi
+			if gcm_has_category "$categories" firewall; then
+				gcm_category_log INFO firewall start 'msg=Portable firewall apply started'
+				if gcm_apply_portable_firewall "$config_dir"; then gcm_category_log INFO firewall complete 'result=success'; else apply_ok=0; gcm_category_log ERROR firewall failed 'result=failed'; fi
+			else gcm_category_log INFO firewall skipped 'reason=not-selected'; fi
 			if gcm_has_category "$categories" timezone; then
+				gcm_category_log INFO timezone start 'msg=Timezone apply started'
 				section=$(gcm_profile_sections "$config_dir" timezone | sed -n '1p')
-				[ -n "$section" ] && { gcm_set_if_value system '@system[0]' zonename "$(gcm_profile_get "$config_dir" "$section" zonename)"; gcm_set_if_value system '@system[0]' timezone "$(gcm_profile_get "$config_dir" "$section" timezone)"; gcm_adapter_commit system; }
+				if [ -n "$section" ]; then
+					if gcm_set_if_value system '@system[0]' zonename "$(gcm_profile_get "$config_dir" "$section" zonename)" && gcm_set_if_value system '@system[0]' timezone "$(gcm_profile_get "$config_dir" "$section" timezone)" && gcm_adapter_commit system; then gcm_category_log INFO timezone complete 'result=success'; else apply_ok=0; gcm_category_log ERROR timezone failed 'result=failed'; fi
+				else gcm_category_log INFO timezone skipped 'reason=missing-source-section'; fi
 			fi
-			if gcm_has_category "$categories" ddns; then gcm_apply_portable_ddns "$config_dir" || apply_ok=0; fi
-			if gcm_has_category "$categories" vpn; then gcm_apply_portable_vpn "$config_dir/vpn" || apply_ok=0; fi
+			if gcm_has_category "$categories" ddns; then
+				gcm_category_log INFO ddns start 'msg=DDNS preference apply started'
+				if gcm_apply_portable_ddns "$config_dir"; then gcm_category_log INFO ddns complete 'result=adapted'; else apply_ok=0; gcm_category_log ERROR ddns failed 'result=failed'; fi
+			fi
+			if gcm_has_category "$categories" vpn; then
+				gcm_category_log INFO vpn start 'msg=VPN structural apply started'
+				if gcm_apply_portable_vpn "$config_dir/vpn"; then gcm_category_log INFO vpn complete 'result=adapted'; else apply_ok=0; gcm_category_log ERROR vpn failed 'result=failed'; fi
+			fi
 			;;
 		clone|remote-safe|snapshot)
-			gcm_apply_raw_uci "$prefix_dir/uci" "$strategy" "$categories" || apply_ok=0
-			gcm_apply_extra_tree "$prefix_dir/extra" || apply_ok=0
+			gcm_category_log INFO uci start "strategy=$strategy" 'msg=Raw UCI apply started'
+			if gcm_apply_raw_uci "$prefix_dir/uci" "$strategy" "$categories"; then gcm_category_log INFO uci complete 'result=success'; else apply_ok=0; gcm_category_log ERROR uci failed 'result=failed'; fi
+			gcm_category_log INFO persistent start 'msg=Persistent file apply started'
+			if gcm_apply_extra_tree "$prefix_dir/extra"; then gcm_category_log INFO persistent complete 'result=success'; else apply_ok=0; gcm_category_log ERROR persistent failed 'result=failed'; fi
 			;;
 		legacy-portable)
 			# Legacy raw packages are deliberately narrower than the old backend:
@@ -1764,7 +2130,8 @@ gcm_restore() {
 			for package in dhcp firewall wireguard openvpn adguardhome ddns; do
 				[ -f "$prefix_dir/uci/$package" ] || continue
 				case "$package" in dhcp) gcm_has_category "$categories" dhcp || continue ;; firewall) gcm_has_category "$categories" firewall || continue ;; wireguard|openvpn) gcm_has_category "$categories" vpn || continue ;; ddns) gcm_has_category "$categories" ddns || continue ;; esac
-				uci import "$package" < "$prefix_dir/uci/$package" && uci commit "$package" || apply_ok=0
+				gcm_diag DEBUG 'action=restore' 'stage=apply' "uci_package=$package" 'action_name=legacy-import' 'msg=Legacy UCI import started'
+				if uci import "$package" < "$prefix_dir/uci/$package" && uci commit "$package"; then gcm_diag DEBUG 'action=restore' 'stage=commit' "uci_package=$package" 'result=success'; else apply_ok=0; gcm_diag ERROR 'action=restore' 'stage=commit' "uci_package=$package" 'result=failed'; fi
 				gcm_log "APPLIED=legacy-uci:$package"
 			done
 			gcm_log 'SKIPPED=legacy:network-and-wireless-whole-package-import-blocked'
@@ -1772,26 +2139,44 @@ gcm_restore() {
 	esac
 	stage="/root/glinet-crossmodel/restore/$profile_id"
 	if [ "$direct_custom" = 1 ]; then custom_root=''; else custom_root="$stage"; fi
-	if gcm_has_category "$categories" custom-files; then gcm_apply_custom_tree "$prefix_dir/artifacts/files" "$custom_root" custom-file || apply_ok=0; fi
+	if gcm_has_category "$categories" custom-files; then
+		gcm_category_log INFO custom-files start "direct=$direct_custom" "destination=${custom_root:-/}" 'msg=Custom file apply started'
+		if gcm_apply_custom_tree "$prefix_dir/artifacts/files" "$custom_root" custom-file; then gcm_category_log INFO custom-files complete 'result=success'; else apply_ok=0; gcm_category_log ERROR custom-files failed 'result=failed'; fi
+	fi
 	if gcm_has_category "$categories" custom-binaries; then
+		gcm_category_log INFO custom-binaries start "direct=$direct_custom" 'msg=Custom binary compatibility and apply started'
 		source_arch=''
 		[ -f "$prefix_dir/manifest.json" ] && source_arch=$(gcm_manifest_field "$prefix_dir/manifest.json" architecture)
 		target_arch=$(gcm_architecture)
-		if [ "$source_arch" = "$target_arch" ]; then gcm_apply_custom_binaries "$prefix_dir/artifacts/binaries" "$custom_root" "$target_arch" || apply_ok=0; else gcm_log "SKIPPED=custom-binaries:source-$source_arch-target-$target_arch"; fi
+		if [ "$source_arch" = "$target_arch" ]; then
+			if gcm_apply_custom_binaries "$prefix_dir/artifacts/binaries" "$custom_root" "$target_arch"; then gcm_category_log INFO custom-binaries complete 'result=success'; else apply_ok=0; gcm_category_log ERROR custom-binaries failed 'result=failed'; fi
+		else gcm_category_log WARN custom-binaries skipped "source_architecture=$source_arch" "target_architecture=$target_arch" 'reason=architecture-mismatch'; gcm_log "SKIPPED=custom-binaries:source-$source_arch-target-$target_arch"; fi
 	fi
-	if [ "$apply_ok" -eq 1 ] && gcm_has_category "$categories" packages && [ -f "$prefix_dir/source/packages.tsv" ]; then gcm_install_selected_packages "$prefix_dir/source/packages.tsv" "$package_selection"; fi
+	if [ "$apply_ok" -eq 1 ] && gcm_has_category "$categories" packages && [ -f "$prefix_dir/source/packages.tsv" ]; then
+		gcm_category_log INFO packages start 'msg=Selected package installation phase started'
+		gcm_install_selected_packages "$prefix_dir/source/packages.tsv" "$package_selection"
+		gcm_category_log INFO packages complete 'result=success-with-noncritical-skips-possible'
+	fi
 	if [ "$apply_ok" -ne 1 ]; then
 		gcm_log 'RESTORE=failed;attempting-rollback'
-		gcm_rollback_snapshot "$snapshot" || true
+		gcm_diag ERROR 'action=restore' 'stage=apply' 'result=failed' 'msg=Restore apply failed; rollback is mandatory'
+		if gcm_rollback_snapshot "$snapshot"; then
+			gcm_diag ERROR 'action=restore' 'stage=rollback' 'restore_result=failed' 'rollback_result=success' "elapsed_seconds=$(gcm_elapsed "$restore_started")" 'msg=Restore failed and target state was rolled back'
+		else
+			gcm_diag ERROR 'action=restore' 'stage=rollback' 'restore_result=failed' 'rollback_result=failed' "elapsed_seconds=$(gcm_elapsed "$restore_started")" 'msg=CRITICAL: restore and rollback both failed; inspect the snapshot immediately'
+		fi
 		rm -rf "$work"
 		return 1
 	fi
 	if [ "${GCM_DEFER_RELOAD:-0}" = 1 ]; then
 		gcm_log 'DEFERRED=network-firewall-wireless-reload;controller-success-received-first'
+		gcm_diag INFO 'action=restore' 'stage=services' 'result=deferred' 'services=network,firewall,wireless' 'reason=remote-controller-safety'
 	else
 		gcm_log 'PENDING_ACTIVATION=network-firewall-wireless;reboot-or-explicit-activate-required'
+		gcm_diag INFO 'action=restore' 'stage=services' 'result=pending-activation' 'services=network,firewall,wireless' 'msg=No automatic connectivity reload performed'
 	fi
 	gcm_log 'RESTORE=success'
 	gcm_log "ROLLBACK_SNAPSHOT=$snapshot/pre-restore.tar.gz"
+	gcm_diag INFO 'action=restore' 'stage=complete' "strategy=$strategy" "rollback_snapshot=$snapshot/pre-restore.tar.gz" "elapsed_seconds=$(gcm_elapsed "$restore_started")" 'result=success' 'msg=Restore completed'
 	rm -rf "$work"
 }

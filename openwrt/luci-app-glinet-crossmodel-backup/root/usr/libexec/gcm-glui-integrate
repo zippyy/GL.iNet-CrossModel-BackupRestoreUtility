@@ -5,31 +5,43 @@ set -u
 GL_HOME='/www/gl_home.html'
 HOOK='/www/js/gcm-glui-hook.js'
 TAG_PREFIX='<script data-gcm-glui="1" src="/js/gcm-glui-hook.js?v='
+if [ -r /usr/lib/glinet-crossmodel/core.sh ]; then
+	# shellcheck source=/dev/null
+	. /usr/lib/glinet-crossmodel/core.sh
+	GCM_COMPONENT=glinet-integration
+	GCM_SCOPE=local
+	gcm_prepare_operation glinet-integration
+else
+	gcm_diag() { :; }
+fi
 
 clear_luci_cache() {
 	rm -f /tmp/luci-indexcache
 	rm -rf /tmp/luci-modulecache
+	gcm_diag DEBUG 'action=glinet-integration' 'stage=luci-cache' 'result=cleared'
 }
 
 remove_hook() {
-	[ -f "$GL_HOME" ] || return 0
+	[ -f "$GL_HOME" ] || { gcm_diag INFO 'action=glinet-integration' 'stage=remove' 'result=skipped' 'reason=gl-admin-home-missing'; return 0; }
 	# GL home is normally minified. Remove only the script element owned by
 	# this package; never rewrite unrelated vendor markup.
 	sed -i 's#<script data-gcm-glui="1" src="/js/gcm-glui-hook.js[^>]*></script>##g' "$GL_HOME"
 	clear_luci_cache
+	gcm_diag INFO 'action=glinet-integration' 'stage=remove' "target=$GL_HOME" 'result=success' 'msg=GL.iNet Admin Panel hook removed'
 }
 
 install_hook() {
-	[ -s /etc/glversion ] || return 0
-	[ -f "$GL_HOME" ] || return 0
-	[ -f "$HOOK" ] || return 1
-	grep -qF 'data-gcm-glui="1"' "$GL_HOME" && return 0
+	[ -s /etc/glversion ] || { gcm_diag INFO 'action=glinet-integration' 'stage=detect' 'result=skipped' 'reason=generic-openwrt'; return 0; }
+	[ -f "$GL_HOME" ] || { gcm_diag WARN 'action=glinet-integration' 'stage=detect' 'result=skipped' 'reason=gl-admin-home-missing'; return 0; }
+	[ -f "$HOOK" ] || { gcm_diag ERROR 'action=glinet-integration' 'stage=locate-hook' "hook=$HOOK" 'result=failed' 'reason=hook-missing'; return 1; }
+	grep -qF 'data-gcm-glui="1"' "$GL_HOME" && { gcm_diag DEBUG 'action=glinet-integration' 'stage=install' 'result=skipped' 'reason=already-installed'; return 0; }
 	version=$(/usr/bin/glinet-crossmodel version 2>/dev/null || printf unknown)
 	temporary="/tmp/gcm-gl-home.$$"
-	sed "s#</body>#${TAG_PREFIX}${version}\"></script></body>#" "$GL_HOME" > "$temporary" || { rm -f "$temporary"; return 1; }
-	grep -qF 'data-gcm-glui="1"' "$temporary" || { rm -f "$temporary"; return 1; }
+	sed "s#</body>#${TAG_PREFIX}${version}\"></script></body>#" "$GL_HOME" > "$temporary" || { rm -f "$temporary"; gcm_diag ERROR 'action=glinet-integration' 'stage=render' 'result=failed'; return 1; }
+	grep -qF 'data-gcm-glui="1"' "$temporary" || { rm -f "$temporary"; gcm_diag ERROR 'action=glinet-integration' 'stage=verify' 'result=failed' 'reason=hook-marker-missing'; return 1; }
 	cat "$temporary" > "$GL_HOME"
 	rm -f "$temporary"
+	gcm_diag INFO 'action=glinet-integration' 'stage=install' "target=$GL_HOME" "tool_version=$version" 'result=success' 'msg=GL.iNet Admin Panel hook installed'
 }
 
 case "${1:-}" in

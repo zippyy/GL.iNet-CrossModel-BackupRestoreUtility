@@ -24,3 +24,9 @@ make package/luci-app-glinet-crossmodel-backup/compile V=s
 Runtime behavior is never introduced by the builder. See the root README for
 CLI/controller examples, archive v2, strategy guarantees, Package Review,
 legacy behavior, and real-router validation requirements.
+
+Diagnostics are written with the `glinet-crossmodel` syslog tag and to the
+bounded RAM-backed `/tmp/glinet-crossmodel/gcm.log`. Use
+`logread -e glinet-crossmodel` or `tail -f /tmp/glinet-crossmodel/gcm.log` while
+troubleshooting. Logging configuration and the LuCI diagnostics controls are
+documented in the root README.

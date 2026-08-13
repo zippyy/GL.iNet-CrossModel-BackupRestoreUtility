@@ -22,6 +22,13 @@ grep -Fq "current ~= connection.saved.verified_fingerprint" "$CONTROLLER"
 grep -Fxq '/root/.ssh/known_hosts' "$KEEP"
 grep -Fq 'function action_settings_save()' "$CONTROLLER"
 grep -Fq "byId('save-storage').addEventListener" "$VIEW"
+grep -Fq 'function action_diagnostics()' "$CONTROLLER"
+grep -Fq 'function action_logging_save()' "$CONTROLLER"
+grep -Fq 'function action_logs_clear()' "$CONTROLLER"
+grep -Fq 'id="diagnostic-log"' "$VIEW"
+grep -Fq "jsonRequest('/api/logging-save'" "$VIEW"
+grep -Fq "jsonRequest('/api/logs-clear'" "$VIEW"
+grep -Fq 'GCM_OP_ID=' "$CONTROLLER"
 if grep -Eqi 'md5(sum)?' "$REMOTE"; then
 	echo 'Remote coordinator still uses MD5.' >&2
 	exit 1
