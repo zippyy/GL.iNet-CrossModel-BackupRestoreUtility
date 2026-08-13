@@ -139,12 +139,20 @@ local function write_json(value, status)
 end
 
 local function read_json_request()
-	return jsonc.parse(http.content() or "") or {}
+	if current_request and current_request.request_json_read then return current_request.request_json end
+	local value = jsonc.parse(http.content() or "") or {}
+	if current_request then current_request.request_json = value; current_request.request_json_read = true end
+	return value
 end
 
-local function require_csrf()
+local function require_csrf(supplied)
 	if http.getenv("REQUEST_METHOD") ~= "POST" then write_json({ error = "POST required." }, 405); return nil end
-	local supplied = tostring(http.getenv("HTTP_X_CSRF_TOKEN") or "")
+	if supplied == nil then
+		local input = read_json_request()
+		supplied = input.token
+		input.token = nil
+	end
+	supplied = tostring(supplied or "")
 	local expected = tostring(dispatcher.context.authtoken or "")
 	if supplied == "" or expected == "" or supplied ~= expected then write_json({ error = "Invalid or expired LuCI request token. Reload the page." }, 403); return nil end
 	return true
@@ -406,9 +414,14 @@ local function receive_archive(destination)
 		if collecting and eof then if stream then stream:close(); stream = nil end; collecting = false end
 	end)
 	http.formvalue("archive")
+	local supplied = http.formvalue("token", true)
 	if stream then stream:close() end
-	if not upload_seen or bytes == 0 or bytes > MAX_UPLOAD or not fs.access(destination) then diagnostic_log("WARN", current_request and current_request.operation_id or "none", "archive", { action = "import", stage = "upload", bytes = bytes, result = "failed", reason = "missing-empty-or-too-large" }, "Archive upload rejected"); fs.unlink(destination); return nil, "Upload an archive smaller than 128 MB." end
+	if not upload_seen or bytes == 0 or bytes > MAX_UPLOAD or not fs.access(destination) then diagnostic_log("WARN", current_request and current_request.operation_id or "none", "archive", { action = "import", stage = "upload", bytes = bytes, result = "failed", reason = "missing-empty-or-too-large" }, "Archive upload rejected"); fs.unlink(destination); return nil, "Upload an archive smaller than 128 MB.", supplied end
 	fs.chmod(destination, "0600")
+	return true, nil, supplied, bytes
+end
+
+local function validate_received_archive(destination, bytes)
 	local ok = command("tar -tzf " .. quote(destination) .. " >/dev/null")
 	if not ok then diagnostic_log("ERROR", current_request and current_request.operation_id or "none", "archive", { action = "import", stage = "archive-format", bytes = bytes, result = "failed", reason = "unreadable-tar" }, "Uploaded archive is unreadable"); fs.unlink(destination); return nil, "Uploaded archive is unreadable." end
 	diagnostic_log("INFO", current_request and current_request.operation_id or "none", "archive", { action = "import", stage = "upload", bytes = bytes, result = "success" }, "Archive upload completed")
@@ -550,12 +563,15 @@ end
 
 function action_import()
 	local operation_id = begin_request("import")
-	if not require_csrf() then return end
+	if http.getenv("REQUEST_METHOD") ~= "POST" then return write_json({ error = "POST required." }, 405) end
 	ensure_directories()
 	local temporary = TMP_DIR .. "/import-" .. operation_id .. ".tar.gz"
 	diagnostic_log("INFO", operation_id, "luci", { action = "import", stage = "upload", destination = temporary }, "Profile import started")
-	local received, receive_error = receive_archive(temporary)
+	local received, receive_error, supplied, bytes = receive_archive(temporary)
+	if not require_csrf(supplied) then fs.unlink(temporary); return end
 	if not received then return write_json({ error = receive_error }, 400) end
+	local archive_valid, archive_error = validate_received_archive(temporary, bytes)
+	if not archive_valid then return write_json({ error = archive_error }, 400) end
 	local manifest, inspect_error = inspect_archive(temporary, operation_id)
 	if not manifest then fs.unlink(temporary); return write_json({ error = inspect_error }, 400) end
 	local destination = profile_archive(operation_id)

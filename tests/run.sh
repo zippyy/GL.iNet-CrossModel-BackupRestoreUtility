@@ -4,6 +4,8 @@ ROOT=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 sh "$ROOT/tests/test-core.sh"
 sh "$ROOT/tests/test-security.sh"
 sh "$ROOT/tests/test-controller-security.sh"
+sh "$ROOT/tests/test-csrf-transport.sh"
+sh "$ROOT/tests/test-controller-csrf-runtime.sh"
 sh "$ROOT/tests/test-logging.sh"
 sh "$ROOT/tests/test-remote-logging.sh"
 sh -n "$ROOT/openwrt/luci-app-glinet-crossmodel-backup/root/usr/lib/glinet-crossmodel/core.sh"

@@ -77,7 +77,7 @@ the local RPC path is usable before falling back.
 ## Install and use directly
 
 ```sh
-opkg install /tmp/luci-app-glinet-crossmodel-backup_2.0.0-4_all.ipk
+opkg install /tmp/luci-app-glinet-crossmodel-backup_2.0.0-5_all.ipk
 
 glinet-crossmodel facts
 glinet-crossmodel create \
@@ -248,7 +248,7 @@ target GL.iNet OpenWrt 21.02 opkg while preserving `Architecture: all`:
 ```sh
 sh tests/run.sh
 bash scripts/build-openwrt-ipk.sh
-tar -tzf dist/luci-app-glinet-crossmodel-backup_2.0.0-4_all.ipk
+tar -tzf dist/luci-app-glinet-crossmodel-backup_2.0.0-5_all.ipk
 ```
 
 The build copies checked-in runtime source byte-for-byte. It does not patch or
