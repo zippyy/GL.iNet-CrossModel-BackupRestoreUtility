@@ -145,7 +145,7 @@ end
 local function require_csrf()
 	if http.getenv("REQUEST_METHOD") ~= "POST" then write_json({ error = "POST required." }, 405); return nil end
 	local supplied = tostring(http.getenv("HTTP_X_CSRF_TOKEN") or "")
-	local expected = tostring(dispatcher.context.authsession or "")
+	local expected = tostring(dispatcher.context.authtoken or "")
 	if supplied == "" or expected == "" or supplied ~= expected then write_json({ error = "Invalid or expired LuCI request token. Reload the page." }, 403); return nil end
 	return true
 end

@@ -16,7 +16,13 @@ grep -Fq 'StrictHostKeyChecking=accept-new' "$REMOTE"
 grep -Fq 'UserKnownHostsFile="$KNOWN_HOSTS"' "$REMOTE"
 grep -Fq 'sha256sum' "$REMOTE"
 grep -Fq 'HTTP_X_CSRF_TOKEN' "$CONTROLLER"
-grep -Fq 'dispatcher.context.authsession' "$CONTROLLER"
+grep -Fq 'dispatcher.context.authtoken' "$CONTROLLER"
+grep -Fq 'luci.dispatcher.context.authtoken' "$VIEW"
+grep -Fq 'jsonc.stringify(token)' "$VIEW"
+if grep -Fq 'dispatcher.context.authsession' "$CONTROLLER" || grep -Fq 'luci.dispatcher.context.authsession' "$VIEW"; then
+	echo 'CSRF protection must use LuCI authtoken, not the login session ID.' >&2
+	exit 1
+fi
 grep -Fq "X-CSRF-Token']=" "$VIEW"
 grep -Fq "current ~= connection.saved.verified_fingerprint" "$CONTROLLER"
 grep -Fxq '/root/.ssh/known_hosts' "$KEEP"
