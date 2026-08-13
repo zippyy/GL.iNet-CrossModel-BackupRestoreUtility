@@ -1,0 +1,3 @@
+#!/bin/sh
+# Compatibility entry point retained for existing LuCI/API callers.
+exec /usr/bin/glinet-crossmodel validate "$@"

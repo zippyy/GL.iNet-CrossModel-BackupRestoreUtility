@@ -1,0 +1,35 @@
+# Native router package
+
+The package source in `luci-app-glinet-crossmodel-backup/` is canonical. It
+contains the LuCI controller/view, local/controller CLI, streamed remote
+coordinator, shared runtime, GL Admin Panel integration, default retention
+configuration, and sysupgrade keep declaration.
+
+The repository's `main` branch is the authoritative source for this package.
+The separate `docker` branch does not build or publish this IPK.
+
+The same architecture-independent IPK supports local/direct and agentless
+controller operation. Remote endpoints need SSH, standard OpenWrt tools, and
+SHA-256 support; they do not need the package installed.
+
+Build with the repository builder:
+
+```sh
+bash scripts/build-openwrt-ipk.sh
+```
+
+Or copy the package directory into a matching OpenWrt/GL.iNet SDK and run:
+
+```sh
+make package/luci-app-glinet-crossmodel-backup/compile V=s
+```
+
+Runtime behavior is never introduced by the builder. See the root README for
+CLI/controller examples, archive v2, strategy guarantees, Package Review,
+legacy behavior, and real-router validation requirements.
+
+Diagnostics are written with the `glinet-crossmodel` syslog tag and to the
+bounded RAM-backed `/tmp/glinet-crossmodel/gcm.log`. Use
+`logread -e glinet-crossmodel` or `tail -f /tmp/glinet-crossmodel/gcm.log` while
+troubleshooting. Logging configuration and the LuCI diagnostics controls are
+documented in the root README.

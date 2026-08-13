@@ -1,0 +1,82 @@
+name: Build and Release GL.iNet IPK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Static and security tests
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y lua5.1 shellcheck
+          sh tests/run.sh
+          luac5.1 -p openwrt/luci-app-glinet-crossmodel-backup/root/usr/lib/lua/luci/controller/glinet_crossmodel.lua
+          node tests/test-view-js.cjs
+          shellcheck --severity=warning \
+            openwrt/luci-app-glinet-crossmodel-backup/root/usr/bin/glinet-crossmodel \
+            openwrt/luci-app-glinet-crossmodel-backup/root/usr/lib/glinet-crossmodel/core.sh \
+            openwrt/luci-app-glinet-crossmodel-backup/root/usr/libexec/glinet-crossmodel-remote \
+            openwrt/luci-app-glinet-crossmodel-backup/root/usr/libexec/glinet-crossmodel-backup \
+            openwrt/luci-app-glinet-crossmodel-backup/root/usr/libexec/glinet-crossmodel-validate \
+            openwrt/luci-app-glinet-crossmodel-backup/root/usr/libexec/gcm-glui-integrate \
+            openwrt/luci-app-glinet-crossmodel-backup/root/etc/init.d/gcm-glui-integration \
+            scripts/real-router-smoke.sh
+
+      - name: Build package
+        run: |
+          chmod +x scripts/build-openwrt-ipk.sh
+          scripts/build-openwrt-ipk.sh
+
+      - name: Validate GL.iNet package
+        run: |
+          set -euo pipefail
+          ipk=$(find dist -maxdepth 1 -type f -name '*.ipk' | head -n1)
+          test -n "$ipk"
+          tar -tzf "$ipk" | grep -qx './debian-binary'
+          tar -tzf "$ipk" | grep -qx './data.tar.gz'
+          tar -tzf "$ipk" | grep -qx './control.tar.gz'
+          test "$(tar -xOzf "$ipk" ./debian-binary)" = '2.0'
+
+      - name: Read package version
+        id: package
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^PKG_VERSION:=//p' openwrt/luci-app-glinet-crossmodel-backup/Makefile | head -n1)
+          release=$(sed -n 's/^PKG_RELEASE:=//p' openwrt/luci-app-glinet-crossmodel-backup/Makefile | head -n1)
+          test -n "$version"
+          test -n "$release"
+          echo "tag=v${version}-${release}" >> "$GITHUB_OUTPUT"
+          echo "title=GL.iNet Cross-Model Backup ${version}-${release}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.package.outputs.tag }}
+          TITLE: ${{ steps.package.outputs.title }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.ipk dist/*.ipk.sha256 --clobber
+          else
+            gh release create "$TAG" dist/*.ipk dist/*.ipk.sha256 \
+              --target "$GITHUB_SHA" \
+              --title "$TITLE" \
+              --generate-notes
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: glinet-crossmodel-backup-ipk
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 90

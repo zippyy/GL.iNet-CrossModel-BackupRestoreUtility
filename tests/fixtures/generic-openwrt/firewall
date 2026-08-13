@@ -1,0 +1,18 @@
+config zone 'lan_zone'
+	option name 'lan'
+	list network 'lan'
+	option input 'ACCEPT'
+
+config zone 'wan_zone'
+	option name 'wan'
+	list network 'wan'
+	option input 'REJECT'
+
+config redirect 'fixture_https'
+	option name 'Fixture HTTPS'
+	option src 'wan'
+	option dest 'lan'
+	option src_dport '443'
+	option dest_ip '192.0.2.10'
+	option dest_port '443'
+	option proto 'tcp'

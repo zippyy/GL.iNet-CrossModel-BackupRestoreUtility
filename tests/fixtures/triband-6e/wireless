@@ -1,0 +1,6 @@
+config wifi-device 'phy_a'
+	option band '6g'
+config wifi-device 'phy_b'
+	option band '2g'
+config wifi-device 'phy_c'
+	option band '5g'

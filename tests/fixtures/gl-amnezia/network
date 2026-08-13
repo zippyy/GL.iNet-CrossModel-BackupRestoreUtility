@@ -1,0 +1,17 @@
+config device 'br_lan'
+	option name 'br-lan'
+	option type 'bridge'
+
+config interface 'awgclient'
+	option proto 'amneziawg'
+	option private_key 'fixture-private-key'
+	option device 'awg0'
+	option Jc '4'
+	option Jmin '40'
+	option Jmax '70'
+
+config amneziawg_awgclient
+	option public_key 'fixture-peer-public-key'
+	option preshared_key 'fixture-preshared-key'
+	option endpoint_host 'vpn.example.test'
+	option endpoint_port '51820'

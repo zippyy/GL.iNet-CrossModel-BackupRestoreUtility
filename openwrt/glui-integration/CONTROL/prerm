@@ -1,9 +1,0 @@
-#!/bin/sh
-
-[ -n "$IPKG_INSTROOT" ] && exit 0
-
-/etc/init.d/gcm-glui-integration stop || true
-/etc/init.d/gcm-glui-integration disable || true
-/usr/libexec/gcm-glui-integrate --remove || true
-
-exit 0

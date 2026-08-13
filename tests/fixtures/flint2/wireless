@@ -1,0 +1,19 @@
+config wifi-device 'radio0'
+	option band '2g'
+	option channel 'auto'
+
+config wifi-device 'radio1'
+	option band '5g'
+	option channel 'auto'
+
+config wifi-iface 'main24'
+	option device 'radio0'
+	option network 'lan'
+	option ssid 'Fixture Main'
+	option encryption 'sae-mixed'
+
+config wifi-iface 'guest5'
+	option device 'radio1'
+	option network 'guest'
+	option ssid 'Fixture Guest'
+	option isolate '1'
