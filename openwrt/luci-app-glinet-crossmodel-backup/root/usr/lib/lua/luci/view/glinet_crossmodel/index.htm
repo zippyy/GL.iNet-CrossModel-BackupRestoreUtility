@@ -9,10 +9,10 @@ local csrf_token = tostring(token or "")
 </style>
 
 <div id="gcm-app">
-  <header class="gcm-top">
-    <div><div class="gcm-kicker">GL.iNet / OpenWrt recovery utility</div><h2>Backup, migrate, clone, recover</h2><p>One native IPK for this router and agentless SSH operations against other routers.</p></div>
+  <section class="gcm-top" aria-labelledby="gcm-title">
+    <div><div class="gcm-kicker">GL.iNet / OpenWrt recovery utility</div><h2 id="gcm-title">Backup, migrate, clone, recover</h2><p>One native IPK for this router and agentless SSH operations against other routers.</p></div>
     <div class="gcm-controller"><strong id="fact-model">Detecting this router…</strong><span id="fact-detail">Loading firmware, architecture, and adapter</span></div>
-  </header>
+  </section>
 
   <div class="gcm-workbar" aria-label="Operation scope">
     <b>Operate on</b>
