@@ -1,13 +1,22 @@
-# GL.iNet Cross-Model Backup / Restore Utility
+# GL.iNet Cross-Model Backup / Restore Utility — Docker Edition
 
-A self-hosted utility for moving portable GL.iNet configuration between router models over SSH and UCI.
+A self-hosted Docker utility for moving portable GL.iNet configuration between
+router models over SSH and UCI. This branch contains only the Docker/Node.js
+edition. The supported native router IPK, LuCI application, and on-router CLI
+are maintained on the repository's `main` branch.
+
+> **Experimental restore path:** the Docker edition does not yet provide the
+> native edition's mandatory pre-restore snapshot, verified rollback, or v2
+> tar archive integrity boundary. Use backup and validation for evaluation;
+> do not use Docker restore on a production router until those safeguards are
+> implemented and tested here.
 
 It creates a portable JSON profile rather than a raw firmware backup. Profiles can include network, wireless, VPN, firewall, AdGuard Home, DDNS, and limited system UCI data plus optional package manifests, custom scripts/files, and custom ELF binaries.
 
 ## Deploy
 
 ```bash
-git clone --branch dev https://github.com/zippyy/GL.iNet-CrossModel-BackupRestoreUtility.git
+git clone --branch docker https://github.com/zippyy/GL.iNet-CrossModel-BackupRestoreUtility.git
 cd GL.iNet-CrossModel-BackupRestoreUtility
 docker compose up -d --build
 ```
