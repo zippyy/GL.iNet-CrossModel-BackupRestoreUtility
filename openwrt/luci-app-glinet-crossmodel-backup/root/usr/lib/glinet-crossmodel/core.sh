@@ -1294,6 +1294,26 @@ gcm_portable_source_bands() {
 	sed -n "s/^[[:space:]]*option band '\([^']*\)'.*/\1/p" "$profile" | sort -u
 }
 
+gcm_portable_firewall_zones() {
+	profile=$1
+	awk '
+		BEGIN { squote=sprintf("%c", 39) }
+		$1 == "config" {
+			type=$2
+			gsub(squote, "", type)
+			gsub(/"/, "", type)
+			next
+		}
+		(type == "firewall_rule" || type == "port_forward") &&
+		$1 == "option" && ($2 == "src" || $2 == "dest") {
+			zone=$3
+			gsub(squote, "", zone)
+			gsub(/"/, "", zone)
+			if (zone != "") print zone
+		}
+	' "$profile" | sort -u
+}
+
 gcm_file_count_type() {
 	file=$1
 	type=$2
@@ -1486,7 +1506,7 @@ gcm_validate() {
 		if gcm_has_category "$categories" firewall; then
 			target_zones=$(gcm_target_firewall_zones | tr '\n' ' ')
 			missing=''
-			for zone in $(sed -n "s/^[[:space:]]*option \(src\|dest\) '\([^']*\)'.*/\2/p" "$portable" | sort -u); do
+			for zone in $(gcm_portable_firewall_zones "$portable"); do
 				if gcm_firewall_zone_exists "$zone" "$target_zones"; then :; else missing="${missing:+$missing, }$zone"; fi
 			done
 			if [ -n "$missing" ]; then compatible=false; gcm_add_result "$incompatible" "Portable firewall objects reference target-missing zones: $missing"; else gcm_add_result "$will" 'Portable firewall rules and port forwards reference known target zones.'; fi

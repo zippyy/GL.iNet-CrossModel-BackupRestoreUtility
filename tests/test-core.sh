@@ -25,7 +25,7 @@ make_v2() {
 	tar -C "$work" -czf "$archive" glinet-crossmodel
 }
 
-printf '1..41\n'
+printf '1..42\n'
 
 assert_true gcm_safe_member 'glinet-crossmodel/manifest.json'
 assert_false gcm_safe_member '../etc/shadow'
@@ -41,6 +41,10 @@ assert_eq "$triband_bands" '2.4 5 6' 'maps tri-band 6E fixture capabilities'
 
 assert_true gcm_firewall_zone_exists lan 'wan lan guest'
 assert_false gcm_firewall_zone_exists vpn 'wan lan guest'
+
+portable_profile="$TEST_ROOT/portable-profile"
+printf "config firewall_rule\n\toption src 'wan'\n\toption dest 'lan'\n\nconfig file_mapping\n\toption src '/www'\n\toption dest 'cgi-bin'\n" > "$portable_profile"
+assert_eq "$(gcm_portable_firewall_zones "$portable_profile" | tr '\n' ' ' | sed 's/ $//')" 'lan wan' 'limits portable firewall-zone validation to firewall objects'
 
 assert_true gcm_strategy_compatible clone 'GL-MT6000' 'gl-mt6000' '' '' 0
 assert_false gcm_strategy_compatible clone 'GL-MT6000' 'GL-MT3000' '' '' 0
