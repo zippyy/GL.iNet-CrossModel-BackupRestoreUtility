@@ -138,6 +138,18 @@ local function write_json(value, status)
 	http.write(jsonc.stringify(value))
 end
 
+local function stream_open_file(file)
+	local ok, stream_error = pcall(function()
+		while true do
+			local chunk = file:read(32 * 1024)
+			if not chunk then break end
+			http.write(chunk)
+		end
+	end)
+	file:close()
+	return ok, stream_error
+end
+
 local function read_json_request()
 	if current_request and current_request.request_json_read then return current_request.request_json end
 	local value = jsonc.parse(http.content() or "") or {}
@@ -744,17 +756,25 @@ function action_download(profile_id)
 	local operation_id = begin_request("profile-download")
 	local path = profile_archive(profile_id)
 	if not path or not fs.access(path) then diagnostic_log("WARN", operation_id, "luci", { action = "profile-download", stage = "locate", status = 404, profile_uuid = profile_id, result = "failed" }, "Profile download not found"); http.status(404, "Not Found"); return http.write("Profile not found") end
+	local file = io.open(path, "rb")
+	if not file then diagnostic_log("ERROR", operation_id, "luci", { action = "profile-download", stage = "open", status = 500, profile_uuid = profile_id, result = "failed" }, "Profile archive could not be opened"); http.status(500, "Internal Server Error"); return http.write("Profile download could not be opened") end
 	http.header("Content-Disposition", "attachment; filename=glinet-crossmodel-" .. profile_id .. ".tar.gz")
 	http.prepare_content("application/gzip")
-	diagnostic_log("INFO", operation_id, "luci", { action = "profile-download", stage = "response", status = 200, profile_uuid = profile_id, result = "success" }, "Profile archive download started")
-	http.writefile(path)
+	diagnostic_log("INFO", operation_id, "luci", { action = "profile-download", stage = "stream-start", status = 200, profile_uuid = profile_id, result = "started" }, "Profile archive download started")
+	local ok = stream_open_file(file)
+	if not ok then diagnostic_log("ERROR", operation_id, "luci", { action = "profile-download", stage = "stream", status = 500, profile_uuid = profile_id, result = "failed" }, "Profile archive download stream failed"); return end
+	diagnostic_log("INFO", operation_id, "luci", { action = "profile-download", stage = "complete", status = 200, profile_uuid = profile_id, result = "success" }, "Profile archive download completed")
 end
 
 function action_diagnostics_download()
 	local operation_id = begin_request("diagnostics-download")
 	if not fs.access(LOG_FILE) then http.status(404, "Not Found"); diagnostic_log("WARN", operation_id, "luci", { action = "diagnostics-download", stage = "locate", status = 404, result = "failed" }, "Diagnostic log not found"); return http.write("Diagnostic log not found") end
+	local file = io.open(LOG_FILE, "rb")
+	if not file then diagnostic_log("ERROR", operation_id, "luci", { action = "diagnostics-download", stage = "open", status = 500, result = "failed" }, "Diagnostic log could not be opened"); http.status(500, "Internal Server Error"); return http.write("Diagnostic log could not be opened") end
 	http.header("Content-Disposition", "attachment; filename=glinet-crossmodel-diagnostics.log")
 	http.prepare_content("text/plain")
-	diagnostic_log("INFO", operation_id, "luci", { action = "diagnostics-download", stage = "response", status = 200, result = "success" }, "Diagnostic log download started")
-	http.writefile(LOG_FILE)
+	diagnostic_log("INFO", operation_id, "luci", { action = "diagnostics-download", stage = "stream-start", status = 200, result = "started" }, "Diagnostic log download started")
+	local ok = stream_open_file(file)
+	if not ok then diagnostic_log("ERROR", operation_id, "luci", { action = "diagnostics-download", stage = "stream", status = 500, result = "failed" }, "Diagnostic log download stream failed"); return end
+	diagnostic_log("INFO", operation_id, "luci", { action = "diagnostics-download", stage = "complete", status = 200, result = "success" }, "Diagnostic log download completed")
 end

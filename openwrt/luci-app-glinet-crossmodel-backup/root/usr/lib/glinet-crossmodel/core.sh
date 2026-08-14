@@ -1314,6 +1314,19 @@ gcm_portable_firewall_zones() {
 	' "$profile" | sort -u
 }
 
+gcm_portable_missing_firewall_zones() {
+	missing_profile=$1
+	missing_target_zones=$2
+	gcm_portable_firewall_zones "$missing_profile" | awk -v target_zones=" $missing_target_zones " '
+		$0 == "" || $0 == "*" { next }
+		index(target_zones, " " $0 " ") == 0 {
+			if (missing != "") missing=missing ", "
+			missing=missing $0
+		}
+		END { print missing }
+	'
+}
+
 gcm_file_count_type() {
 	file=$1
 	type=$2
@@ -1505,10 +1518,7 @@ gcm_validate() {
 		fi
 		if gcm_has_category "$categories" firewall; then
 			target_zones=$(gcm_target_firewall_zones | tr '\n' ' ')
-			missing=''
-			for zone in $(gcm_portable_firewall_zones "$portable"); do
-				if gcm_firewall_zone_exists "$zone" "$target_zones"; then :; else missing="${missing:+$missing, }$zone"; fi
-			done
+			missing=$(gcm_portable_missing_firewall_zones "$portable" "$target_zones")
 			if [ -n "$missing" ]; then compatible=false; gcm_add_result "$incompatible" "Portable firewall objects reference target-missing zones: $missing"; else gcm_add_result "$will" 'Portable firewall rules and port forwards reference known target zones.'; fi
 		fi
 		gcm_add_result "$preserve" 'Physical Ethernet assignments, switch/DSA topology, board interface names, and factory identity are never imported.'
@@ -1576,8 +1586,20 @@ gcm_validate() {
 	printf ',"warnings":'; gcm_json_array_file "$warn"
 	printf ',"dangerous_actions":'; gcm_json_array_file "$dangerous"
 	printf '}\n'
-	if [ "$compatible" = true ]; then validation_result=pass; validation_severity=INFO; else validation_result=failed; validation_severity=ERROR; fi
-	gcm_diag "$validation_severity" 'action=validate' 'stage=source-target-compatibility' "strategy=$strategy" "result=$validation_result" "elapsed_seconds=$(gcm_elapsed "$validate_started")" 'msg=Validation completed'
+	incompatible_count=0
+	if [ "$compatible" = true ]; then
+		validation_result=pass
+		validation_severity=INFO
+	else
+		validation_result=failed
+		validation_severity=ERROR
+		while IFS= read -r validation_reason || [ -n "$validation_reason" ]; do
+			[ -n "$validation_reason" ] || continue
+			incompatible_count=$((incompatible_count + 1))
+			gcm_diag ERROR 'action=validate' 'stage=source-target-compatibility' "strategy=$strategy" "reason=$validation_reason" 'result=failed' 'msg=Validation incompatibility detected'
+		done < "$incompatible"
+	fi
+	gcm_diag "$validation_severity" 'action=validate' 'stage=source-target-compatibility' "strategy=$strategy" "result=$validation_result" "incompatible_count=$incompatible_count" "elapsed_seconds=$(gcm_elapsed "$validate_started")" 'msg=Validation completed'
 	rm -rf "$work"
 	GCM_COMPONENT=$previous_component
 }
