@@ -1152,6 +1152,8 @@ gcm_write_manifest() {
 			remote-safe) printf 'Restore is hard-blocked unless models match and management-path configuration is preserved.\n' ;;
 			snapshot) printf 'Restore is hard-blocked unless the stable physical-device fingerprint matches.\n' ;;
 		esac
+		printf '\nProject: https://github.com/zippyy/GL.iNet-CrossModel-BackupRestoreUtility\n'
+		printf 'Contact: https://techrelay.xyz/contact\n'
 	} > "$prefix_dir/backup-info.txt"
 }
 

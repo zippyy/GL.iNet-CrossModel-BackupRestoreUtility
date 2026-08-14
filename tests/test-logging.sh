@@ -32,6 +32,12 @@ portable="$TEST_ROOT/portable.tar.gz"
 clone="$TEST_ROOT/clone.tar.gz"
 GCM_LIB="$CORE" sh "$CLI" create --output "$portable" --strategy portable --name 'JSON safety portable' --categories packages --scripts-list "$empty" --binaries-list "$empty" >/dev/null
 GCM_LIB="$CORE" sh "$CLI" create --output "$clone" --strategy clone --name 'JSON safety clone' --categories packages --scripts-list "$empty" --binaries-list "$empty" >/dev/null
+tar -xOzf "$portable" glinet-crossmodel/backup-info.txt > "$TEST_ROOT/backup-info.txt"
+grep -Fxq 'Project: https://github.com/zippyy/GL.iNet-CrossModel-BackupRestoreUtility' "$TEST_ROOT/backup-info.txt"
+grep -Fxq 'Contact: https://techrelay.xyz/contact' "$TEST_ROOT/backup-info.txt"
+if grep -Eqi 'remotetohome|remote to home' "$TEST_ROOT/backup-info.txt"; then
+	echo 'Generated backup information contains obsolete third-party attribution.' >&2; exit 1
+fi
 
 GCM_LIB="$CORE" sh "$CLI" facts > "$TEST_ROOT/facts.json"
 GCM_LIB="$CORE" sh "$CLI" inspect "$portable" > "$TEST_ROOT/inspect.json"
