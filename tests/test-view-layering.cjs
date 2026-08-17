@@ -31,4 +31,13 @@ if (!/#gcm-app td:nth-child\(6\)::before\{content:"Actions"\}/.test(view)) {
   throw new Error('The profile library must expose labelled stacked rows at the narrow breakpoint.');
 }
 
+const responsiveLayouts = Array.from(view.matchAll(/@media\(max-width:(\d+)px\)\{#gcm-app \.gcm-layout\{grid-template-columns:1fr\}/g));
+if (!responsiveLayouts.some((match) => Number(match[1]) >= 1024)) {
+  throw new Error('The responsive workflow must activate at a 1024px CSS viewport before the profile table is squeezed.');
+}
+
+if (!/#gcm-app \.gcm-library \.gcm-section-head>\.gcm-button\{flex:0 0 auto;white-space:nowrap\}/.test(view)) {
+  throw new Error('The profile-library Refresh button must not shrink or wrap at intermediate widths.');
+}
+
 console.log('LuCI host-navigation layering contract passed');
