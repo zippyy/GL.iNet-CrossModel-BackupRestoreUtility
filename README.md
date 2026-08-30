@@ -115,8 +115,8 @@ the release public key once, then the package installs from LuCI
 # On the router, one-time: trust the release signing key (fetched from the latest release)
 curl -fsSL -o /etc/apk/keys/glinet-crossmodel.pub https://github.com/zippyy/GL.iNet-CrossModel-BackupRestoreUtility/releases/latest/download/glinet-crossmodel.pub
 
-# Then, from LuCI upload or over SSH:
-apk add /tmp/luci-app-glinet-crossmodel-backup-2.0.0-r14-noarch.apk
+# Then install the signed apk straight from the latest release (or upload it via LuCI):
+curl -fsSL -o /tmp/luci-app-glinet-crossmodel-backup-2.0.0-r14-noarch.apk https://github.com/zippyy/GL.iNet-CrossModel-BackupRestoreUtility/releases/latest/download/luci-app-glinet-crossmodel-backup-2.0.0-r14-noarch.apk && apk add /tmp/luci-app-glinet-crossmodel-backup-2.0.0-r14-noarch.apk
 ```
 
 The key is also attached to every release as `glinet-crossmodel.pub`.
