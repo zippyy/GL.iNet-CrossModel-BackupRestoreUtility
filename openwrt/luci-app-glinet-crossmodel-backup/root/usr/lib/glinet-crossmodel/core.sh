@@ -12,6 +12,12 @@ GCM_PREFIX='glinet-crossmodel'
 GCM_TOOL_VERSION='2.0.0'
 GCM_MAX_FILE_BYTES=${GCM_MAX_FILE_BYTES:-8388608}
 GCM_MAX_TOTAL_BYTES=${GCM_MAX_TOTAL_BYTES:-33554432}
+# Archive-wide expansion limits for the pre-extraction member scan. These are
+# deliberately more generous than the custom-file limits so legitimate clone
+# and snapshot payloads (which can include larger persistent files) are not
+# rejected, while a decompression/expansion bomb still cannot pass.
+GCM_ARCHIVE_MAX_FILE_BYTES=${GCM_ARCHIVE_MAX_FILE_BYTES:-67108864}
+GCM_ARCHIVE_MAX_TOTAL_BYTES=${GCM_ARCHIVE_MAX_TOTAL_BYTES:-268435456}
 GCM_PATH=${GCM_PATH:-/usr/sbin:/usr/bin:/sbin:/bin}
 GCM_LOG_TAG=${GCM_LOG_TAG:-glinet-crossmodel}
 GCM_LOG_DIR=${GCM_LOG_DIR:-/tmp/glinet-crossmodel}
@@ -246,6 +252,10 @@ gcm_member_under_prefix() {
 gcm_check_archive_members() {
 	archive=$1
 	mode=${2:-v2}
+	# Expansion limits are read at call time so callers and tests can
+	# override them per invocation.
+	max_file=${GCM_ARCHIVE_MAX_FILE_BYTES:-67108864}
+	max_total=${GCM_ARCHIVE_MAX_TOTAL_BYTES:-268435456}
 	GCM_STAGE='member-safety'
 	gcm_diag DEBUG "action=${GCM_ACTION:-archive}" "stage=$GCM_STAGE" "archive=$archive" "archive_type=$mode" 'msg=Archive member validation started'
 	[ -f "$archive" ] || gcm_die 'Archive is missing.' || return 1
@@ -268,6 +278,33 @@ gcm_check_archive_members() {
 	# FIFOs, sockets, block/character devices, and other extraction side effects.
 	if tar -tzvf "$archive" 2>/dev/null | awk 'substr($0,1,1)!="-" && substr($0,1,1)!="d" {bad=1} END{exit bad?0:1}'; then
 		rm -f "$members"; gcm_die 'Archive contains a non-file/non-directory member.'; return 1
+	fi
+	# Reject decompression/expansion bombs before extraction using the sizes
+	# declared in the archive listing. GNU/BusyBox tar place the member size in
+	# the third field of `tar -tzvf`; macOS bsdtar places it in the fifth.
+	# Accept either layout by locating the numeric field that immediately
+	# precedes the date token (dash-form date on GNU/BusyBox, month name on
+	# macOS). A file member whose size cannot be verified is rejected before
+	# extraction.
+	if tar -tzvf "$archive" 2>/dev/null | awk -v max_file="$max_file" -v max_total="$max_total" '
+		function is_month(f) {
+			return (f == "Jan" || f == "Feb" || f == "Mar" || f == "Apr" || f == "May" || f == "Jun" || f == "Jul" || f == "Aug" || f == "Sep" || f == "Oct" || f == "Nov" || f == "Dec")
+		}
+		$1 ~ /^-/ {
+			found = 0
+			size = 0
+			# GNU/BusyBox print the member size immediately before the
+			# dash-form date; macOS bsdtar prints it before the month name.
+			for (i = 2; i < NF; i++) {
+				if ($i ~ /^[0-9]+$/ && ($(i+1) ~ /-/ || is_month($(i+1)))) { size = $i + 0; found = 1; break }
+			}
+			if (!found) { print "unverifiable-size"; exit 0 }
+			if (size > max_file) { print "oversize"; exit 0 }
+			total += size
+			if (total > max_total) { print "overtotal"; exit 0 }
+		}
+	' | grep -q .; then
+		rm -f "$members"; gcm_die 'Archive declares members beyond the bounded size limits.'; return 1
 	fi
 	rm -f "$members"
 	gcm_diag DEBUG "action=${GCM_ACTION:-archive}" "stage=$GCM_STAGE" "member_count=$member_count" 'result=pass' 'msg=Archive members are safe'
@@ -1847,16 +1884,17 @@ gcm_apply_portable_vpn() {
 }
 
 gcm_prune_rollbacks() {
-	rollback_root='/root/glinet-crossmodel/rollback'
+	rollback_root=${GCM_ROLLBACK_ROOT:-/root/glinet-crossmodel/rollback}
 	keep=$(gcm_uci_get glinet_crossmodel.storage.max_rollbacks)
 	case "$keep" in ''|*[!0-9]*) keep=5 ;; esac
 	[ "$keep" -ge 1 ] 2>/dev/null || keep=1
 	mkdir -p "$rollback_root" || return 1
 	gcm_diag DEBUG "action=${GCM_ACTION:-restore}" 'stage=prune' 'component_name=storage' "rollback_root=$rollback_root" "max_rollbacks=$keep" 'msg=Rollback pruning evaluated'
 	# Keep room for the snapshot about to be created. All candidates are
-	# application-owned UUID directories beneath the fixed rollback root.
+	# application-owned directories beneath the fixed rollback root; the name
+	# charset covers both profile UUIDs and legacy operation IDs.
 	ls -1dt "$rollback_root"/* 2>/dev/null | awk -v keep="$keep" 'NR>=keep' | while IFS= read -r old; do
-		case "$old" in "$rollback_root"/[A-Fa-f0-9-]*) gcm_diag INFO "action=${GCM_ACTION:-restore}" 'stage=prune' 'component_name=storage' "path=$old" 'result=removed'; rm -rf "$old" ;; esac
+		case "$old" in "$rollback_root"/[A-Za-z0-9_-]*) gcm_diag INFO "action=${GCM_ACTION:-restore}" 'stage=prune' 'component_name=storage' "path=$old" 'result=removed'; rm -rf "$old" ;; esac
 	done
 }
 
@@ -1868,18 +1906,28 @@ gcm_pre_restore_snapshot() {
 	snapshot_started=$(date +%s 2>/dev/null || printf 0)
 	gcm_diag INFO 'action=restore' 'stage=snapshot-start' "profile_uuid=$profile_id" "direct_custom_files=$direct_custom" 'msg=Mandatory pre-restore snapshot creation started'
 	gcm_prune_rollbacks || return 1
-	root="/root/glinet-crossmodel/rollback/$profile_id"
-	data="$root/glinet-crossmodel-rollback"
+	rollback_root=${GCM_ROLLBACK_ROOT:-/root/glinet-crossmodel/rollback}
+	root="$rollback_root/$profile_id"
+	snapshot_root="$root/glinet-crossmodel-rollback"
+	uci_dir="$snapshot_root/etc/config"
 	rm -rf "$root"
-	mkdir -p "$data/etc/config" || return 1
-	: > "$data/created-paths.txt"
-	for source in /etc/config/*; do [ -f "$source" ] && [ ! -L "$source" ] && cp -p "$source" "$data/etc/config/"; done
+	mkdir -p "$uci_dir" || return 1
+	mkdir -p "$snapshot_root/uci-delta" || return 1
+	created_paths="$snapshot_root/created-paths.txt"
+	: > "$created_paths"
+	for source in /etc/config/*; do [ -f "$source" ] && [ ! -L "$source" ] && cp -p "$source" "$uci_dir/"; done
+	# Capture transient UCI delta state so rollback can reload it and prevent
+	# stale deltas from re-materializing after a failed restore.
+	for delta in $(gcm_delta_files); do
+		[ -f "$delta" ] || continue
+		cp -p "$delta" "$snapshot_root/uci-delta/${delta##*/}" 2>/dev/null || true
+	done
 	tree="$prefix_dir/extra"
 	if [ -d "$tree" ]; then
 		find "$tree" -type f | while IFS= read -r source; do
 			relative=${source#"$tree"/}; gcm_safe_member "$relative" || exit 1
 			target="/$relative"
-			if [ -f "$target" ] && [ ! -L "$target" ]; then gcm_copy_with_root "$target" "$data/root" || exit 1; else printf '%s\n' "$target" >> "$data/created-paths.txt"; fi
+			if [ -f "$target" ] && [ ! -L "$target" ]; then gcm_copy_with_root "$target" "$snapshot_root/root" || exit 1; else printf '%s\n' "$target" >> "$created_paths"; fi
 		done || return 1
 	fi
 	if [ "$direct_custom" = 1 ]; then
@@ -1888,17 +1936,19 @@ gcm_pre_restore_snapshot() {
 			find "$tree" -type f | while IFS= read -r source; do
 				relative=${source#"$tree"/}; gcm_safe_member "$relative" || exit 1
 				target="/$relative"
-				if [ -f "$target" ] && [ ! -L "$target" ]; then gcm_copy_with_root "$target" "$data/root" || exit 1; else printf '%s\n' "$target" >> "$data/created-paths.txt"; fi
+				if [ -f "$target" ] && [ ! -L "$target" ]; then gcm_copy_with_root "$target" "$snapshot_root/root" || exit 1; else printf '%s\n' "$target" >> "$created_paths"; fi
 			done || return 1
 		done
 	fi
-	printf 'created_at=%s\nmodel=%s\nfingerprint=%s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date)" "$(gcm_source_model)" "$(gcm_device_fingerprint)" > "$data/rollback-info.txt"
-	file_count=$(find "$data" -type f 2>/dev/null | wc -l | tr -d ' ')
+	printf 'created_at=%s\nmodel=%s\nfingerprint=%s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date)" "$(gcm_source_model)" "$(gcm_device_fingerprint)" > "$snapshot_root/rollback-info.txt"
+	file_count=$(find "$snapshot_root" -type f 2>/dev/null | wc -l | tr -d ' ')
 	gcm_diag DEBUG 'action=restore' 'stage=snapshot-checksums' "snapshot_path=$root" "files=$file_count" 'msg=Rollback checksum generation started'
 	(cd "$root" && find glinet-crossmodel-rollback -type f ! -name checksums.sha256 | sort | while IFS= read -r path; do sha256sum "$path"; done > glinet-crossmodel-rollback/checksums.sha256) || return 1
+	# The snapshot must be verified before restore proceeds.
+	(cd "$root" && sha256sum -c glinet-crossmodel-rollback/checksums.sha256 >/dev/null 2>&1) || { gcm_diag ERROR 'action=restore' 'stage=snapshot-checksums' 'result=failed' 'reason=snapshot-integrity'; gcm_log 'SNAPSHOT=failed:integrity'; return 1; }
 	tar -C "$root" -czf "$root/pre-restore.tar.gz" glinet-crossmodel-rollback || return 1
 	snapshot_size=$(wc -c < "$root/pre-restore.tar.gz" 2>/dev/null | tr -d ' ' || printf unknown)
-	gcm_diag INFO 'action=restore' 'stage=snapshot-complete' "snapshot_path=$root/pre-restore.tar.gz" "files=$file_count" "archive_size=$snapshot_size" "elapsed_seconds=$(gcm_elapsed "$snapshot_started")" 'result=success' 'msg=Pre-restore snapshot created'
+	gcm_diag INFO 'action=restore' 'stage=snapshot-complete' "snapshot_path=$root/pre-restore.tar.gz" "files=$file_count" "archive_size=$snapshot_size" "elapsed_seconds=$(gcm_elapsed "$snapshot_started")" 'result=success' 'msg=Pre-restore snapshot created and verified'
 	GCM_COMPONENT=$previous_component
 	printf '%s\n' "$root"
 }
@@ -1909,40 +1959,61 @@ gcm_rollback_snapshot() {
 	rollback_started=$(date +%s 2>/dev/null || printf 0)
 	gcm_diag WARN 'action=rollback' 'stage=start' "snapshot_path=$root" 'msg=Rollback started after restore failure'
 	data="$root/glinet-crossmodel-rollback/etc/config"
+	created_paths="$root/glinet-crossmodel-rollback/created-paths.txt"
+	rollback_root_files="$root/glinet-crossmodel-rollback/root"
+	uci_delta_dir="${GCM_UCI_DELTA_DIR:-/tmp/.uci}"
+	target_root="${GCM_ROLLBACK_TARGET_ROOT:-/}"
 	[ -d "$data" ] || { gcm_diag ERROR 'action=rollback' 'stage=locate' 'result=failed' 'reason=snapshot-missing'; gcm_log 'ROLLBACK=failed:snapshot-missing'; return 1; }
 	checksums="$root/glinet-crossmodel-rollback/checksums.sha256"
 	[ -s "$checksums" ] && (cd "$root" && sha256sum -c glinet-crossmodel-rollback/checksums.sha256 >/dev/null 2>&1) || { gcm_diag ERROR 'action=rollback' 'stage=checksum-verification' 'result=failed' 'reason=snapshot-integrity'; gcm_log 'ROLLBACK=failed:snapshot-integrity'; return 1; }
 	gcm_diag DEBUG 'action=rollback' 'stage=checksum-verification' 'result=pass'
 	result=0
 	files_restored=0
+	# Reload the UCI delta state captured at snapshot time so the restored
+	# files cannot re-materialize stale configuration deltas from /tmp/.uci.
+	if [ -d "$root/glinet-crossmodel-rollback/uci-delta" ]; then
+		mkdir -p "$uci_delta_dir" 2>/dev/null || result=1
+		for delta in "$root/glinet-crossmodel-rollback/uci-delta"/*; do
+			[ -f "$delta" ] || continue
+			delta_package=${delta##*/}
+			: > "$uci_delta_dir/$delta_package" 2>/dev/null || result=1
+			cp -p "$delta" "$uci_delta_dir/$delta_package" 2>/dev/null || result=1
+		done
+	fi
 	for source in "$data"/*; do
 		[ -f "$source" ] || continue
 		rollback_package=${source##*/}
 		gcm_diag TRACE 'action=rollback' 'stage=uci-restore' "uci_package=$rollback_package" 'action_name=replace' 'msg=Restoring UCI package from snapshot'
-		if cp -p "$source" "/etc/config/$rollback_package"; then files_restored=$((files_restored + 1)); else result=1; gcm_diag ERROR 'action=rollback' 'stage=uci-restore' "uci_package=$rollback_package" 'result=failed'; fi
+		if cp -p "$source" "${target_root%/}/etc/config/$rollback_package"; then files_restored=$((files_restored + 1)); else result=1; gcm_diag ERROR 'action=rollback' 'stage=uci-restore' "uci_package=$rollback_package" 'result=failed'; fi
 	done
-	if [ -d "$root/glinet-crossmodel-rollback/root" ]; then
-		find "$root/glinet-crossmodel-rollback/root" -type f | while IFS= read -r source; do
-			relative=${source#"$root/glinet-crossmodel-rollback/root"/}
+	if [ -d "$rollback_root_files" ]; then
+		find "$rollback_root_files" -type f | while IFS= read -r source; do
+			relative=${source#"$rollback_root_files"/}
 			gcm_safe_member "$relative" || exit 1
-			target="/$relative"; mkdir -p "$(dirname "$target")" || exit 1; cp -p "$source" "$target" || exit 1
+			target="${target_root%/}/$relative"; mkdir -p "$(dirname "$target")" || exit 1; cp -p "$source" "$target" || exit 1
 		done || result=1
 	fi
-	if [ -f "$root/glinet-crossmodel-rollback/created-paths.txt" ]; then
-		while IFS= read -r target || [ -n "$target" ]; do [ -n "$target" ] && gcm_safe_absolute_path "$target" >/dev/null && { rm -f "$target"; gcm_diag TRACE 'action=rollback' 'stage=remove-created-paths' "path=$target" 'result=removed'; }; done < "$root/glinet-crossmodel-rollback/created-paths.txt"
+	if [ -f "$created_paths" ]; then
+		while IFS= read -r target || [ -n "$target" ]; do
+			[ -n "$target" ] || continue
+			case "$target" in
+				/*) gcm_safe_absolute_path "$target" >/dev/null && { rm -f "${target_root%/}$target"; gcm_diag TRACE 'action=rollback' 'stage=remove-created-paths' "path=$target" 'result=removed'; } ;;
+				*) ;; # Relative entries are never created paths.
+			esac
+		done < "$created_paths"
 	fi
 	for source in "$data"/*; do
 		[ -f "$source" ] || continue
-		cmp -s "$source" "/etc/config/${source##*/}" || result=1
+		cmp -s "$source" "${target_root%/}/etc/config/${source##*/}" || result=1
 	done
-	if [ -d "$root/glinet-crossmodel-rollback/root" ]; then
-		find "$root/glinet-crossmodel-rollback/root" -type f | while IFS= read -r source; do
-			relative=${source#"$root/glinet-crossmodel-rollback/root"/}
-			cmp -s "$source" "/$relative" || exit 1
+	if [ -d "$rollback_root_files" ]; then
+		find "$rollback_root_files" -type f | while IFS= read -r source; do
+			relative=${source#"$rollback_root_files"/}
+			cmp -s "$source" "${target_root%/}/$relative" || exit 1
 		done || result=1
 	fi
-	if [ -f "$root/glinet-crossmodel-rollback/created-paths.txt" ]; then
-		while IFS= read -r target || [ -n "$target" ]; do [ -n "$target" ] && [ ! -e "$target" ] || result=1; done < "$root/glinet-crossmodel-rollback/created-paths.txt"
+	if [ -f "$created_paths" ]; then
+		while IFS= read -r target || [ -n "$target" ]; do [ -n "$target" ] && [ ! -e "${target_root%/}$target" ] || result=1; done < "$created_paths"
 	fi
 	if [ "$result" -eq 0 ]; then
 		gcm_diag INFO 'action=rollback' 'stage=verification' "files_restored=$files_restored" "elapsed_seconds=$(gcm_elapsed "$rollback_started")" 'result=success' 'msg=Rollback verified'
@@ -1950,6 +2021,26 @@ gcm_rollback_snapshot() {
 	fi
 	gcm_diag ERROR 'action=rollback' 'stage=verification' "files_restored=$files_restored" "elapsed_seconds=$(gcm_elapsed "$rollback_started")" 'result=failed' 'reason=verification-mismatch'
 	gcm_log 'ROLLBACK=failed:verification-mismatch'; GCM_COMPONENT=$previous_component; return 1
+}
+
+gcm_delta_files() {
+	# UCI delta files for every package under /tmp/.uci. The snapshot needs to
+	# capture transient UCI state so rollback can reload it and prevent stale
+	# deltas from re-materializing after a failed restore.
+	[ -d /tmp/.uci ] || return 0
+	find /tmp/.uci -maxdepth 1 -type f -name '[A-Za-z0-9_.-]*' 2>/dev/null | sort
+}
+
+gcm_clear_uci_delta() {
+	# Apply must be deterministic: a stale delta left by a prior configuration
+	# change to this package would be committed together with the restored
+	# file. Clear only this package's delta so the commit contains exactly the
+	# restored values, while unrelated pending UCI changes are preserved.
+	package=$1
+	[ -d /tmp/.uci ] || return 0
+	[ -n "$package" ] || return 0
+	case "$package" in *[!A-Za-z0-9_.-]*) return 1 ;; esac
+	rm -f "/tmp/.uci/$package" 2>/dev/null || true
 }
 
 gcm_apply_raw_uci() {
@@ -1963,12 +2054,14 @@ gcm_apply_raw_uci() {
 		case "$package" in network|firewall|wireless) continue ;; esac
 		if [ "$strategy" = snapshot ]; then
 			cp -p "$source" "/etc/config/$package" || return 1
+			gcm_clear_uci_delta "$package"
 			gcm_diag DEBUG 'action=restore' 'stage=commit' "uci_package=$package" 'action_name=replace-snapshot' 'result=success'
 		else
 			identity=$(mktemp /tmp/gcm-raw-identity.XXXXXX) || return 1
 			gcm_target_identity_assignments "$package" "$identity"
 			cp -p "$source" "/etc/config/$package" || { rm -f "$identity"; return 1; }
 			gcm_reapply_target_identity "$identity" || { rm -f "$identity"; return 1; }
+			gcm_clear_uci_delta "$package"
 			if uci commit "$package"; then
 				gcm_diag DEBUG 'action=restore' 'stage=commit' "uci_package=$package" 'action_name=commit' 'result=success'
 			else status=$?; gcm_diag ERROR 'action=restore' 'stage=commit' "uci_package=$package" "exit_code=$status" 'result=failed'; rm -f "$identity"; return 1; fi
@@ -1990,11 +2083,13 @@ gcm_apply_raw_uci() {
 		fi
 		if [ "$strategy" = snapshot ]; then
 			cp -p "$source" "/etc/config/$package" || return 1
+			gcm_clear_uci_delta "$package"
 		else
 			identity=$(mktemp /tmp/gcm-raw-identity.XXXXXX) || return 1
 			gcm_target_identity_assignments "$package" "$identity"
 			cp -p "$source" "/etc/config/$package" || { rm -f "$identity"; return 1; }
 			gcm_reapply_target_identity "$identity" || { rm -f "$identity"; return 1; }
+			gcm_clear_uci_delta "$package"
 			if uci commit "$package"; then
 				gcm_diag DEBUG 'action=restore' 'stage=commit' "uci_package=$package" 'action_name=commit' 'result=success'
 			else status=$?; gcm_diag ERROR 'action=restore' 'stage=commit' "uci_package=$package" "exit_code=$status" 'result=failed'; rm -f "$identity"; return 1; fi
@@ -2086,6 +2181,40 @@ gcm_install_selected_packages() {
 			status=$?; gcm_diag WARN 'action=restore' 'stage=package-install' "package=$package" "exit_code=$status" "elapsed_seconds=$(gcm_elapsed "$install_started")" 'result=failed' 'reason=unavailable-or-incompatible'; gcm_log "SKIPPED=package:$package:unavailable-or-incompatible"
 		fi
 	done
+}
+
+gcm_apply_staged() {
+	# Activate configuration that was intentionally staged or deferred by a
+	# previous restore so the administrator is never stranded without a way to
+	# apply the pending changes.
+	staged_root=${GCM_STAGED_ROOT:-/root/glinet-crossmodel/pending-remote-safe}
+	staged_target_root="${GCM_STAGED_TARGET_ROOT:-/}"
+	[ -d "$staged_root" ] || { gcm_log 'ACTIVATE=no-staged-configuration'; gcm_diag INFO "action=${GCM_ACTION:-activate}" 'stage=locate' 'result=none' 'msg=No staged configuration found'; return 0; }
+	found=0
+	for source in "$staged_root"/*; do
+		[ -f "$source" ] || continue
+		package=${source##*/}
+		case "$package" in network|firewall|wireless) ;; *) gcm_log "SKIPPED=activate:$package:not-staged-connectivity"; continue ;; esac
+		found=1
+		cp -p "$source" "${staged_target_root%/}/etc/config/$package" || { gcm_diag ERROR "action=${GCM_ACTION:-activate}" 'stage=apply' "uci_package=$package" 'result=failed'; return 1; }
+		gcm_clear_uci_delta "$package"
+		if uci commit "$package"; then
+			gcm_diag INFO "action=${GCM_ACTION:-activate}" 'stage=apply' "uci_package=$package" 'result=success'
+			gcm_log "ACTIVATED=uci:$package"
+		else
+			gcm_diag ERROR "action=${GCM_ACTION:-activate}" 'stage=commit' "uci_package=$package" 'result=failed'
+			return 1
+		fi
+		rm -f "$source"
+	done
+	if [ "$found" -eq 1 ]; then
+		gcm_log 'ACTIVATE=staged-connectivity-applied;manual-service-reload-or-reboot-required'
+		gcm_diag INFO "action=${GCM_ACTION:-activate}" 'stage=complete' 'result=success' 'msg=Staged connectivity configuration applied; service reload or reboot is required to take effect'
+	else
+		gcm_log 'ACTIVATE=no-staged-configuration;reload-network-firewall-wifi-or-reboot-to-apply-previous-restore'
+		gcm_diag INFO "action=${GCM_ACTION:-activate}" 'stage=complete' 'result=none' 'msg=No staged connectivity configuration found; reload network, firewall, and Wi-Fi services or reboot to apply a previous restore'
+	fi
+	return 0
 }
 
 gcm_restore() {
@@ -2216,8 +2345,8 @@ gcm_restore() {
 		gcm_log 'DEFERRED=network-firewall-wireless-reload;controller-success-received-first'
 		gcm_diag INFO 'action=restore' 'stage=services' 'result=deferred' 'services=network,firewall,wireless' 'reason=remote-controller-safety'
 	else
-		gcm_log 'PENDING_ACTIVATION=network-firewall-wireless;reboot-or-explicit-activate-required'
-		gcm_diag INFO 'action=restore' 'stage=services' 'result=pending-activation' 'services=network,firewall,wireless' 'msg=No automatic connectivity reload performed'
+		gcm_log 'PENDING_ACTIVATION=network-firewall-wireless;run-glinet-crossmodel-activate-to-apply'
+		gcm_diag INFO 'action=restore' 'stage=services' 'result=pending-activation' 'services=network,firewall,wireless' 'msg=No automatic connectivity reload performed; run glinet-crossmodel activate to apply staged files'
 	fi
 	gcm_log 'RESTORE=success'
 	gcm_log "ROLLBACK_SNAPSHOT=$snapshot/pre-restore.tar.gz"

@@ -444,7 +444,7 @@ function index()
 	local system = entry({ "admin", "system" }, firstchild(), _("System"), 60)
 	system.dependent = false
 	entry({ "admin", "system", "glinet-crossmodel" }, call("action_index"), _("Backup & Recovery"), 92).dependent = false
-	for _, route in ipairs({ "facts", "routers", "router-save", "router-delete", "test", "profiles", "settings", "settings-save", "create", "import", "inspect", "validate", "packages", "restore", "profile-update", "profile-delete", "diagnostics", "logging-save", "logs-clear" }) do
+	for _, route in ipairs({ "facts", "routers", "router-save", "router-delete", "test", "profiles", "settings", "settings-save", "create", "import", "inspect", "validate", "packages", "restore", "activate", "profile-update", "profile-delete", "diagnostics", "logging-save", "logs-clear" }) do
 		entry({ "admin", "system", "glinet-crossmodel", "api", route }, call("action_" .. route:gsub("%-", "_"))).leaf = true
 	end
 	entry({ "admin", "system", "glinet-crossmodel", "download" }, call("action_download")).leaf = true
@@ -692,6 +692,23 @@ function action_restore()
 		ok, output = invoke(CLI, "restore", arguments, "GCM_OP_ID=" .. quote(operation_id) .. " GCM_SCOPE=local GCM_LOG_LEVEL=" .. quote(configured_log_level())); status = ok and 200 or 500
 	end
 	if not ok then return write_json({ error = trim(output) ~= "" and trim(output) or "Restore failed." }, status) end
+	write_json({ ok = true, log = output }, 200)
+end
+
+function action_activate()
+	local operation_id = begin_request("activate")
+	if not require_csrf() then return end
+	local input = read_json_request()
+	diagnostic_log("INFO", operation_id, "luci", { action = "activate", stage = "dispatch", scope = input.scope == "remote" and "remote" or "local" }, "Staged configuration activation dispatched")
+	local ok, output, status
+	if input.scope == "remote" then
+		local connection, connection_error = normalize_connection(input.connection)
+		if not connection then return write_json({ error = connection_error }, 400) end
+		ok, output = remote_call("activate", { operation_id }, connection, operation_id); status = ok and 200 or 422
+	else
+		ok, output = invoke(CLI, "activate", {}, "GCM_OP_ID=" .. quote(operation_id) .. " GCM_SCOPE=local GCM_LOG_LEVEL=" .. quote(configured_log_level())); status = ok and 200 or 500
+	end
+	if not ok then return write_json({ error = trim(output) ~= "" and trim(output) or "Activation failed." }, status) end
 	write_json({ ok = true, log = output }, 200)
 end
 

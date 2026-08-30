@@ -62,6 +62,7 @@ Usage:
   glinet-crossmodel-remote validate ARCHIVE UUID CATEGORIES OVERRIDE HOST PORT USER AUTH CREDENTIAL
   glinet-crossmodel-remote restore ARCHIVE UUID CATEGORIES PACKAGES DIRECT OVERRIDE ALLOW_LEGACY HOST PORT USER AUTH CREDENTIAL
   glinet-crossmodel-remote packages ARCHIVE UUID HOST PORT USER AUTH CREDENTIAL
+  glinet-crossmodel-remote activate UUID HOST PORT USER AUTH CREDENTIAL
 
 AUTH is password, key, or agent. CREDENTIAL is a mode-0600 password file, a
 private-key path, or '-' for agent authentication. Passwords are never accepted
@@ -368,6 +369,19 @@ remote_packages() {
 	return "$status"
 }
 
+remote_activate() {
+	[ "$#" -eq 6 ] || usage
+	id=$1; host=$2; port=$3; user=$4; auth=$5; credential=$6
+	valid_id "$id" || die 'Invalid operation UUID.'
+	GCM_OP_ID=$id; GCM_ACTION=activate; export GCM_OP_ID GCM_ACTION
+	remote_started=$(date +%s 2>/dev/null || printf 0)
+	gcm_diag INFO 'action=activate' 'stage=start' "host=$host" "port=$port" "user=$user" "auth=$auth" 'msg=Remote staged-configuration activation started'
+	prepare_connection "$host" "$port" "$user" "$auth" "$credential"
+	if stream_cli "$host" "$port" "$user" "$auth" "$credential" activate; then status=0; else status=$?; fi
+	if [ "$status" -eq 0 ]; then gcm_diag INFO 'action=activate' 'stage=complete' "host=$host" "elapsed_seconds=$(gcm_elapsed "$remote_started")" 'result=success'; else gcm_diag ERROR 'action=activate' 'stage=complete' "host=$host" "exit_code=$status" "elapsed_seconds=$(gcm_elapsed "$remote_started")" 'result=failed'; fi
+	return "$status"
+}
+
 if [ "${GCM_REMOTE_LIBRARY_ONLY:-0}" != 1 ]; then
 	case "${1:-}" in
 		facts) shift; remote_facts "$@" ;;
@@ -375,6 +389,7 @@ if [ "${GCM_REMOTE_LIBRARY_ONLY:-0}" != 1 ]; then
 		validate) shift; remote_validate "$@" ;;
 		restore) shift; remote_restore "$@" ;;
 		packages) shift; remote_packages "$@" ;;
+		activate) shift; remote_activate "$@" ;;
 		*) usage ;;
 	esac
 fi

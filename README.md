@@ -23,9 +23,14 @@ not duplicated here.
 - New archives use format v2 and the dedicated `glinet-crossmodel/` prefix.
   They cannot be mistaken for stock root-filesystem backups.
 - Every payload member is SHA-256 hashed. Member paths, top-level paths, links,
-  the manifest version, and hashes are checked before extraction.
+  the manifest version, and hashes are checked before extraction. Archive
+  members are additionally subject to bounded per-file and per-archive size
+  limits enforced from the pre-extraction listing, so an expansion/decompression
+  bomb is rejected before any member is written.
 - Restore always runs read-only validation and creates a target-side
-  pre-restore snapshot before changing files.
+  pre-restore snapshot before changing files. The snapshot captures UCI files
+  and transient UCI delta state, is checksum-verified before restore proceeds,
+  and rollback restores both (plus removes files the failed restore created).
 - Cross-model Portable Profiles never import source radio names, raw wireless,
   raw network topology, Ethernet assignments, switch/DSA layout, factory MACs,
   host keys, device TLS keys, cloud/node identity, or raw flash state.
@@ -36,7 +41,8 @@ not duplicated here.
 - Remote restores return a successful result before any network, firewall, or
   Wi-Fi activation. Remote-Safe Clone preserves target management state and
   stages source connectivity files when an active SSH management session is
-  detected.
+  detected. Staged and deferred configuration is applied explicitly with
+  `glinet-crossmodel activate` (also available from the LuCI validation dialog).
 - Package feeds are advisory. Feed failure does not fail configuration restore,
   and kernel/kmod packages are never installed automatically.
 - Submitted passwords are stored only in transient mode-0600 files. Router
@@ -77,7 +83,7 @@ the local RPC path is usable before falling back.
 ## Install and use directly
 
 ```sh
-opkg install /tmp/luci-app-glinet-crossmodel-backup_2.0.0-12_all.ipk
+opkg install /tmp/luci-app-glinet-crossmodel-backup_2.0.0-13_all.ipk
 
 glinet-crossmodel facts
 glinet-crossmodel create \
@@ -92,6 +98,9 @@ glinet-crossmodel validate /root/portable-profile.tar.gz
 glinet-crossmodel packages /root/portable-profile.tar.gz
 glinet-crossmodel restore /root/portable-profile.tar.gz \
   --categories wifi,lan,dhcp,dns,firewall,timezone,ddns,vpn
+
+# After a remote-safe restore, apply the staged connectivity configuration:
+glinet-crossmodel activate
 ```
 
 Open LuCI at **System → Backup & Recovery**. On GL.iNet firmware 4.x the same
@@ -248,7 +257,7 @@ target GL.iNet OpenWrt 21.02 opkg while preserving `Architecture: all`:
 ```sh
 sh tests/run.sh
 bash scripts/build-openwrt-ipk.sh
-tar -tzf dist/luci-app-glinet-crossmodel-backup_2.0.0-12_all.ipk
+tar -tzf dist/luci-app-glinet-crossmodel-backup_2.0.0-13_all.ipk
 ```
 
 The build copies checked-in runtime source byte-for-byte. It does not patch or

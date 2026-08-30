@@ -25,7 +25,7 @@ make_v2() {
 	tar -C "$work" -czf "$archive" glinet-crossmodel
 }
 
-printf '1..43\n'
+printf '1..50\n'
 
 assert_true gcm_safe_member 'glinet-crossmodel/manifest.json'
 assert_false gcm_safe_member '../etc/shadow'
@@ -129,3 +129,51 @@ assert_eq "$section" 'portable-source-section' 'semantic setter does not clobber
 
 # The remaining malicious-archive checks are run by test-security.sh so this
 # file stays portable across GNU tar and bsdtar hosts.
+
+# --- Rollback created-path removal and UCI-delta restoration (sandboxed) ---
+rollback_dir="$TEST_ROOT/rollback-new"
+rollback_target="$TEST_ROOT/rollback-target"
+uci_delta_dir="$TEST_ROOT/uci-delta"
+rm -rf "$rollback_dir" "$rollback_target" "$uci_delta_dir"
+mkdir -p "$rollback_dir/glinet-crossmodel-rollback/etc/config" "$rollback_dir/glinet-crossmodel-rollback/root/etc" "$rollback_dir/glinet-crossmodel-rollback/uci-delta" "$rollback_target/etc/config" "$uci_delta_dir"
+printf 'original-config\n' > "$rollback_dir/glinet-crossmodel-rollback/etc/config/fixture-pkg"
+printf 'changed\n' > "$rollback_dir/glinet-crossmodel-rollback/root/etc/restored-file"
+printf '/etc/created-file\n' > "$rollback_dir/glinet-crossmodel-rollback/created-paths.txt"
+printf 'delta-original\n' > "$rollback_dir/glinet-crossmodel-rollback/uci-delta/fixture-pkg"
+# Simulated current (post-restore) target state.
+printf 'restored-by-bug\n' > "$rollback_target/etc/config/fixture-pkg"
+printf 'created-by-bug\n' > "$rollback_target/etc/created-file"
+printf 'stale-delta\n' > "$uci_delta_dir/fixture-pkg"
+(cd "$rollback_dir" && find glinet-crossmodel-rollback -type f ! -name checksums.sha256 | sort | while IFS= read -r p; do sha256sum "$p"; done > glinet-crossmodel-rollback/checksums.sha256)
+GCM_ROLLBACK_TARGET_ROOT="$rollback_target" GCM_UCI_DELTA_DIR="$uci_delta_dir" gcm_rollback_snapshot "$rollback_dir" >/dev/null 2>&1
+[ "$(cat "$rollback_target/etc/config/fixture-pkg" 2>/dev/null)" = 'original-config' ] || fail 'rollback restores UCI package files from the snapshot'
+ok 'rollback restores UCI package files'
+[ -e "$rollback_target/etc/restored-file" ] || fail 'rollback restores overwritten persistent files'
+ok 'rollback restores overwritten persistent files'
+[ -e "$rollback_target/etc/created-file" ] && fail 'rollback removes files created during the failed restore'
+ok 'rollback removes files created during the failed restore'
+[ "$(cat "$uci_delta_dir/fixture-pkg" 2>/dev/null)" = 'delta-original' ] || fail 'rollback reloads snapshot UCI deltas'
+ok 'rollback reloads snapshot UCI deltas'
+
+# --- Staged connectivity activation (sandboxed) ---
+# gcm_apply_staged commits UCI on the target; a mock uci keeps this
+# deterministic on hosts that have no OpenWrt tooling.
+mock_bin="$TEST_ROOT/bin"
+mkdir -p "$mock_bin"
+printf '#!/bin/sh\nexit 0\n' > "$mock_bin/uci"
+chmod +x "$mock_bin/uci"
+PATH="$mock_bin:$PATH"
+staged="$TEST_ROOT/staged"
+staged_target="$TEST_ROOT/staged-target"
+rm -rf "$staged" "$staged_target"
+mkdir -p "$staged" "$staged_target/etc/config"
+printf "config interface 'lan'\n" > "$staged/network"
+printf "config defaults\n" > "$staged/firewall"
+GCM_STAGED_ROOT="$staged" GCM_STAGED_TARGET_ROOT="$staged_target" GCM_ACTION=activate gcm_apply_staged >/dev/null 2>&1
+[ -f "$staged/network" ] && fail 'activate applies staged network file'
+ok 'activate applies staged network file'
+[ -f "$staged_target/etc/config/network" ] || fail 'activate places staged network file at target config path'
+ok 'activate places staged network file at target config path'
+[ -f "$staged/firewall" ] && fail 'activate applies staged firewall file'
+ok 'activate applies staged firewall file'
+rm -rf "$staged" "$staged_target" "$uci_delta_dir" "$rollback_dir" "$rollback_target"

@@ -22,6 +22,7 @@ Usage:
   glinet-crossmodel restore ARCHIVE [--categories CSV] [--packages CSV]
       [--direct-custom-files] [--dangerous-device-override] [--allow-legacy]
   glinet-crossmodel packages ARCHIVE
+  glinet-crossmodel activate
   glinet-crossmodel version
 
 Strategies:
@@ -44,6 +45,12 @@ gcm_prepare_operation "$command"
 gcm_diag INFO "action=$command" 'stage=dispatch' 'msg=CLI operation accepted'
 
 case "$command" in
+	activate)
+		[ "$#" -eq 0 ] || usage
+		GCM_COMPONENT=activate
+		export GCM_COMPONENT
+		gcm_apply_staged
+		;;
 	facts)
 		[ "$#" -eq 0 ] || usage
 		GCM_COMPONENT=facts

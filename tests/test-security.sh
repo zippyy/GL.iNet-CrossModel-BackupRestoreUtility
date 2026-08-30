@@ -55,4 +55,20 @@ if gcm_inspect "$TEST_ROOT/unsafe-uuid.tar.gz" json >/dev/null 2>&1; then
 	echo 'Unsafe manifest profile UUID was accepted.' >&2; exit 1
 fi
 
+# Expansion-bomb guard: per-file and per-archive size limits must be enforced
+# from the pre-extraction listing before any member is written.
+bomb_payload="$TEST_ROOT/bomb-payload"
+rm -rf "$bomb_payload"; mkdir -p "$bomb_payload/glinet-crossmodel/source"
+printf 'tiny\n' > "$bomb_payload/glinet-crossmodel/manifest.json"
+( cd "$bomb_payload" && tar -czf "$TEST_ROOT/bomb.tar.gz" glinet-crossmodel )
+if GCM_ARCHIVE_MAX_FILE_BYTES=4 GCM_ARCHIVE_MAX_TOTAL_BYTES=65536 gcm_check_archive_members "$TEST_ROOT/bomb.tar.gz" v2 >/dev/null 2>&1; then
+	echo 'Oversize archive member was accepted despite the per-file limit.' >&2; exit 1
+fi
+if GCM_ARCHIVE_MAX_FILE_BYTES=65536 GCM_ARCHIVE_MAX_TOTAL_BYTES=1 gcm_check_archive_members "$TEST_ROOT/bomb.tar.gz" v2 >/dev/null 2>&1; then
+	echo 'Oversize archive total was accepted despite the total limit.' >&2; exit 1
+fi
+if ! GCM_ARCHIVE_MAX_FILE_BYTES=65536 GCM_ARCHIVE_MAX_TOTAL_BYTES=65536 gcm_check_archive_members "$TEST_ROOT/bomb.tar.gz" v2 >/dev/null 2>&1; then
+	echo 'Within-limit archive was rejected by the size guard.' >&2; exit 1
+fi
+
 echo 'security archive tests passed'
