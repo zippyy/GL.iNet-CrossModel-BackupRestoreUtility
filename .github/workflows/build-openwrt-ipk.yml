@@ -1,4 +1,4 @@
-name: Build and Release GL.iNet IPK
+name: Build and Release GL.iNet packages (ipk + apk)
 
 on:
   workflow_dispatch:
@@ -30,7 +30,8 @@ jobs:
             openwrt/luci-app-glinet-crossmodel-backup/root/usr/libexec/glinet-crossmodel-validate \
             openwrt/luci-app-glinet-crossmodel-backup/root/usr/libexec/gcm-glui-integrate \
             openwrt/luci-app-glinet-crossmodel-backup/root/etc/init.d/gcm-glui-integration \
-            scripts/real-router-smoke.sh
+            scripts/real-router-smoke.sh \
+            scripts/build-openwrt-apk.sh
 
       - name: Build package
         run: |
@@ -80,6 +81,63 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: glinet-crossmodel-backup-ipk
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 90
+
+  build-apk:
+    # OpenWrt 25.x / GL.iNet apk firmware (e.g. Flint 4) uses apk-tools 3.x and
+    # installs signed v3 (ADB) packages. Release creation happens in
+    # build-and-release; this job attaches the signed apk + public key to the
+    # same release.
+    needs: build-and-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare signing key
+        env:
+          APK_SIGN_KEY: ${{ secrets.APK_SIGN_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$APK_SIGN_KEY"
+          umask 077
+          mkdir -p /tmp/apk-key
+          printf '%s' "$APK_SIGN_KEY" | base64 -d > /tmp/apk-key/signing.pem
+          test -s /tmp/apk-key/signing.pem
+          head -1 /tmp/apk-key/signing.pem
+          # The public half must match the checked-in router key.
+          openssl rsa -in /tmp/apk-key/signing.pem -pubout | diff - keys/glinet-crossmodel.pub
+
+      - name: Build and verify signed apk (OpenWrt 25+)
+        run: |
+          docker run --rm \
+            -v "$PWD":/work -w /work \
+            -v /tmp/apk-key:/apkkey:ro \
+            -e APK_SIGN_KEY=/apkkey/signing.pem \
+            alpine:edge sh scripts/build-openwrt-apk.sh
+
+      - name: Read package version
+        id: package
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^PKG_VERSION:=//p' openwrt/luci-app-glinet-crossmodel-backup/Makefile | head -n1)
+          release=$(sed -n 's/^PKG_RELEASE:=//p' openwrt/luci-app-glinet-crossmodel-backup/Makefile | head -n1)
+          test -n "$version"
+          test -n "$release"
+          echo "tag=v${version}-${release}" >> "$GITHUB_OUTPUT"
+
+      - name: Attach apk artifacts to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.package.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" dist/*.apk dist/*.apk.sha256 dist/*.pub --clobber
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: glinet-crossmodel-backup-apk
           path: dist/*
           if-no-files-found: error
           retention-days: 90

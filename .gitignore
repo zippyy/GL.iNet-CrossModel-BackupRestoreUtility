@@ -3,3 +3,4 @@ data/backups/*.json
 .env
 .DS_Store
 dist/
+keys/*.pem

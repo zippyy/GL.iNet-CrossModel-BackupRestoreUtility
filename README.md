@@ -83,7 +83,7 @@ the local RPC path is usable before falling back.
 ## Install and use directly
 
 ```sh
-opkg install /tmp/luci-app-glinet-crossmodel-backup_2.0.0-13_all.ipk
+opkg install /tmp/luci-app-glinet-crossmodel-backup_2.0.0-14_all.ipk
 
 glinet-crossmodel facts
 glinet-crossmodel create \
@@ -102,6 +102,24 @@ glinet-crossmodel restore /root/portable-profile.tar.gz \
 # After a remote-safe restore, apply the staged connectivity configuration:
 glinet-crossmodel activate
 ```
+
+### OpenWrt 25.x / GL.iNet apk firmware (e.g. Flint 4)
+
+Newer firmware uses apk-tools 3.x, which refuses unsigned packages
+(`UNTRUSTED signature`, exit code 99). Releases ship a signed
+`luci-app-glinet-crossmodel-backup-<version>-r<release>-noarch.apk`; install
+the release public key once, then the package installs from LuCI
+(System → Software → Upload) or over SSH:
+
+```sh
+# One-time: trust the release signing key
+scp keys/glinet-crossmodel.pub root@192.168.8.1:/etc/apk/keys/
+
+# Then, from LuCI upload or over SSH:
+apk add /tmp/luci-app-glinet-crossmodel-backup-2.0.0-r14-noarch.apk
+```
+
+The key is also attached to every release as `glinet-crossmodel.pub`.
 
 Open LuCI at **System → Backup & Recovery**. On GL.iNet firmware 4.x the same
 IPK also installs a shortcut in the GL Admin Panel. No companion IPK is needed.
@@ -257,8 +275,12 @@ target GL.iNet OpenWrt 21.02 opkg while preserving `Architecture: all`:
 ```sh
 sh tests/run.sh
 bash scripts/build-openwrt-ipk.sh
-tar -tzf dist/luci-app-glinet-crossmodel-backup_2.0.0-13_all.ipk
+tar -tzf dist/luci-app-glinet-crossmodel-backup_2.0.0-14_all.ipk
 ```
+
+OpenWrt 25+ / apk firmware gets a signed v3 package from
+`scripts/build-openwrt-apk.sh` (requires apk-tools 3.x, e.g. `alpine:edge`,
+and `APK_SIGN_KEY` pointing at the RSA signing key):
 
 The build copies checked-in runtime source byte-for-byte. It does not patch or
 rewrite application behavior. CI runs archive traversal/link/hash tests, format
