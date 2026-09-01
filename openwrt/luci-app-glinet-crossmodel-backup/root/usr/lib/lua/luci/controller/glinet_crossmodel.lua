@@ -1,6 +1,8 @@
 module("luci.controller.glinet_crossmodel", package.seeall)
 
 local http = require "luci.http"
+local ltn12 = require "luci.ltn12"
+local util = require "luci.util"
 local jsonc = require "luci.jsonc"
 local fs = require "nixio.fs"
 local dispatcher = require "luci.dispatcher"
@@ -138,16 +140,36 @@ local function write_json(value, status)
 	http.write(jsonc.stringify(value))
 end
 
+-- Stream an open file handle to the HTTP response without buffering the whole
+-- archive in memory. Legacy LuCI (OpenWrt 22) runs the controller inside a
+-- coroutine and luci.http.write() yields per chunk; on Lua 5.1 it is illegal
+-- to yield across a C pcall() boundary, so the pump must run under
+-- luci.util.copcall() (LuCI's own coroutine-safe pcall), with
+-- luci.ltn12.pump.all() driving the read->write loop. luci.http.write is a
+-- valid LTN12 sink in every supported LuCI generation (22.03 through 25);
+-- the EOF guard keeps sink semantics identical across generations where
+-- http.write(nil) differs (close() on 22.03 vs. L.print(nil) on 25).
 local function stream_open_file(file)
-	local ok, stream_error = pcall(function()
-		while true do
-			local chunk = file:read(32 * 1024)
-			if not chunk then break end
-			http.write(chunk)
-		end
+	local streamed = 0
+	local function source()
+		return file:read(32 * 1024)
+	end
+	local function sink(chunk)
+		if chunk == nil then return true end
+		http.write(chunk)
+		-- Count bytes only after http.write succeeded so the log reflects
+		-- bytes actually handed to the HTTP layer, not bytes merely read.
+		streamed = streamed + #chunk
+		-- Always report success so ltn12.pump.step keeps pumping even if the
+		-- generation's http.write returns nil for a valid chunk (pump.step
+		-- treats a nil sink return as end-of-stream and would truncate).
+		return true
+	end
+	local ok, stream_error = util.copcall(function()
+		return ltn12.pump.all(source, sink)
 	end)
 	file:close()
-	return ok, stream_error
+	return ok, stream_error, streamed
 end
 
 local function read_json_request()
@@ -587,13 +609,62 @@ function action_import()
 	local manifest, inspect_error = inspect_archive(temporary, operation_id)
 	if not manifest then fs.unlink(temporary); return write_json({ error = inspect_error }, 400) end
 	local destination = profile_archive(operation_id)
-	if not fs.rename(temporary, destination) then fs.unlink(temporary); return write_json({ error = "Could not store the imported archive." }, 500) end
+	if not move_file(temporary, destination) then fs.unlink(temporary); return write_json({ error = "Could not store the imported archive." }, 500) end
 	fs.chmod(destination, "0600")
 	if not fs.writefile(profile_sidecar(operation_id), jsonc.stringify({ name = manifest.profile_name or "Imported backup", notes = manifest.notes or "" })) then fs.unlink(destination); return write_json({ error = "Could not store imported profile metadata." }, 500) end
 	fs.chmod(profile_sidecar(operation_id), "0600")
 	local retained, retention_error = enforce_storage(operation_id)
 	if not retained then return write_json({ error = retention_error }, 507) end
 	write_json({ ok = true, id = operation_id, manifest = manifest }, 200)
+end
+
+-- Open a source file for a streaming download after validating it exists and
+-- is a regular file. Returns (file, size) or nil. All failures are reported
+-- before any response body is committed, so an HTTP error status remains
+-- valid at that point.
+local function open_download(path, operation_id, action, profile_uuid, missing_message)
+	local stat = fs.stat(path)
+	if not stat or stat.type ~= "reg" then
+		diagnostic_log("WARN", operation_id, "luci", { action = action, stage = "locate", status = 404, profile_uuid = profile_uuid, result = "failed" }, "Profile download not found")
+		http.status(404, "Not Found")
+		http.prepare_content("text/plain")
+		http.write(missing_message or "Profile not found")
+		return nil
+	end
+	local file = io.open(path, "rb")
+	if not file then
+		diagnostic_log("ERROR", operation_id, "luci", { action = action, stage = "open", status = 500, profile_uuid = profile_uuid, result = "failed" }, "Profile archive could not be opened")
+		http.status(500, "Internal Server Error")
+		http.prepare_content("text/plain")
+		http.write("Profile download could not be opened")
+		return nil
+	end
+	return file, stat.size or 0
+end
+
+-- Move a file across filesystems safely. rename(2) fails with EXDEV when the
+-- source and destination live on different mounts (tmpfs /tmp uploads vs.
+-- overlay /root profile storage on OpenWrt 22), which surfaced as an import
+-- "backend" 500 after every validation pass. Fall back to a bounded streaming
+-- copy followed by unlink of the source. Module-level (not local) so the
+-- regression suite can exercise the EXDEV fallback directly.
+function move_file(source, destination)
+	if fs.rename(source, destination) then return true end
+	local input = io.open(source, "rb")
+	if not input then return nil end
+	local output = io.open(destination, "wb")
+	if not output then input:close(); return nil end
+	local ok = true
+	while true do
+		local chunk = input:read(32 * 1024)
+		if not chunk then break end
+		if not output:write(chunk) then ok = false; break end
+	end
+	input:close()
+	if not output:close() then ok = false end
+	if not ok then fs.unlink(destination); return nil end
+	fs.unlink(source)
+	return true
 end
 
 local function require_profile(input)
@@ -772,26 +843,34 @@ end
 function action_download(profile_id)
 	local operation_id = begin_request("profile-download")
 	local path = profile_archive(profile_id)
-	if not path or not fs.access(path) then diagnostic_log("WARN", operation_id, "luci", { action = "profile-download", stage = "locate", status = 404, profile_uuid = profile_id, result = "failed" }, "Profile download not found"); http.status(404, "Not Found"); return http.write("Profile not found") end
-	local file = io.open(path, "rb")
-	if not file then diagnostic_log("ERROR", operation_id, "luci", { action = "profile-download", stage = "open", status = 500, profile_uuid = profile_id, result = "failed" }, "Profile archive could not be opened"); http.status(500, "Internal Server Error"); return http.write("Profile download could not be opened") end
+	if not path then diagnostic_log("WARN", operation_id, "luci", { action = "profile-download", stage = "locate", status = 404, profile_uuid = profile_id, result = "failed" }, "Profile download not found"); http.status(404, "Not Found"); http.prepare_content("text/plain"); return http.write("Profile not found") end
+	local file, size = open_download(path, operation_id, "profile-download", profile_id)
+	if not file then return end
 	http.header("Content-Disposition", "attachment; filename=glinet-crossmodel-" .. profile_id .. ".tar.gz")
 	http.prepare_content("application/gzip")
-	diagnostic_log("INFO", operation_id, "luci", { action = "profile-download", stage = "stream-start", status = 200, profile_uuid = profile_id, result = "started" }, "Profile archive download started")
-	local ok = stream_open_file(file)
-	if not ok then diagnostic_log("ERROR", operation_id, "luci", { action = "profile-download", stage = "stream", status = 500, profile_uuid = profile_id, result = "failed" }, "Profile archive download stream failed"); return end
-	diagnostic_log("INFO", operation_id, "luci", { action = "profile-download", stage = "complete", status = 200, profile_uuid = profile_id, result = "success" }, "Profile archive download completed")
+	if size > 0 then http.header("Content-Length", tostring(size)) end
+	diagnostic_log("INFO", operation_id, "luci", { action = "profile-download", stage = "stream-start", status = 200, profile_uuid = profile_id, source = path, size = size, result = "started" }, "Profile archive download started")
+	local ok, stream_error, streamed = stream_open_file(file)
+	if not ok then
+		diagnostic_log("ERROR", operation_id, "luci", { action = "profile-download", stage = "stream", profile_uuid = profile_id, expected = size, bytes_streamed = streamed, result = "failed", error = log_clean(stream_error) }, "Profile archive download stream failed after response committed")
+		return
+	end
+	diagnostic_log("INFO", operation_id, "luci", { action = "profile-download", stage = "complete", profile_uuid = profile_id, expected = size, bytes_streamed = streamed, result = "success" }, "Profile archive download completed")
 end
 
 function action_diagnostics_download()
 	local operation_id = begin_request("diagnostics-download")
-	if not fs.access(LOG_FILE) then http.status(404, "Not Found"); diagnostic_log("WARN", operation_id, "luci", { action = "diagnostics-download", stage = "locate", status = 404, result = "failed" }, "Diagnostic log not found"); return http.write("Diagnostic log not found") end
-	local file = io.open(LOG_FILE, "rb")
-	if not file then diagnostic_log("ERROR", operation_id, "luci", { action = "diagnostics-download", stage = "open", status = 500, result = "failed" }, "Diagnostic log could not be opened"); http.status(500, "Internal Server Error"); return http.write("Diagnostic log could not be opened") end
+	if not fs.access(LOG_FILE) then diagnostic_log("WARN", operation_id, "luci", { action = "diagnostics-download", stage = "locate", status = 404, result = "failed" }, "Diagnostic log not found"); http.status(404, "Not Found"); http.prepare_content("text/plain"); return http.write("Diagnostic log not found") end
+	local file, size = open_download(LOG_FILE, operation_id, "diagnostics-download", nil, "Diagnostic log not found")
+	if not file then return end
 	http.header("Content-Disposition", "attachment; filename=glinet-crossmodel-diagnostics.log")
 	http.prepare_content("text/plain")
-	diagnostic_log("INFO", operation_id, "luci", { action = "diagnostics-download", stage = "stream-start", status = 200, result = "started" }, "Diagnostic log download started")
-	local ok = stream_open_file(file)
-	if not ok then diagnostic_log("ERROR", operation_id, "luci", { action = "diagnostics-download", stage = "stream", status = 500, result = "failed" }, "Diagnostic log download stream failed"); return end
-	diagnostic_log("INFO", operation_id, "luci", { action = "diagnostics-download", stage = "complete", status = 200, result = "success" }, "Diagnostic log download completed")
+	if size > 0 then http.header("Content-Length", tostring(size)) end
+	diagnostic_log("INFO", operation_id, "luci", { action = "diagnostics-download", stage = "stream-start", status = 200, size = size, result = "started" }, "Diagnostic log download started")
+	local ok, stream_error, streamed = stream_open_file(file)
+	if not ok then
+		diagnostic_log("ERROR", operation_id, "luci", { action = "diagnostics-download", stage = "stream", expected = size, bytes_streamed = streamed, result = "failed", error = log_clean(stream_error) }, "Diagnostic log download stream failed after response committed")
+		return
+	end
+	diagnostic_log("INFO", operation_id, "luci", { action = "diagnostics-download", stage = "complete", expected = size, bytes_streamed = streamed, result = "success" }, "Diagnostic log download completed")
 end

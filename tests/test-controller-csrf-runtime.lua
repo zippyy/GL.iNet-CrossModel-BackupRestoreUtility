@@ -42,16 +42,29 @@ local jsonc = {
 	parse = function() return request_json end,
 	stringify = function() return "{}" end
 }
+local fixture_log = "/tmp/glinet-crossmodel/gcm.log"
+local fixture_profile = "/root/glinet-crossmodel/profiles/11111111-1111-1111-1111-111111111111.tar.gz"
+local function fixture_size(path)
+	local f = io.open(path, "rb")
+	if not f then return 0 end
+	local size = f:seek("end")
+	f:close()
+	return size
+end
 local fs = {
 	readfile = function(path)
 		if path == "/proc/sys/kernel/random/uuid" then return "11111111-1111-1111-1111-111111111111\n" end
 	end,
-	stat = function() return nil end,
+	stat = function(path)
+		if path == fixture_log then return { type = "reg", size = fixture_size(fixture_log) } end
+		if path == fixture_profile then return { type = "reg", size = fixture_size(fixture_profile) } end
+		return nil
+	end,
 	unlink = function() return true end,
 	rename = function() return true end,
 	access = function(path)
-		return path == "/tmp/glinet-crossmodel/gcm.log"
-			or path == "/root/glinet-crossmodel/profiles/11111111-1111-1111-1111-111111111111.tar.gz"
+		return path == fixture_log
+			or path == fixture_profile
 	end,
 	writefile = function() return true end,
 	chmod = function() return true end,
@@ -74,6 +87,16 @@ package.preload["luci.jsonc"] = function() return jsonc end
 package.preload["nixio.fs"] = function() return fs end
 package.preload["luci.dispatcher"] = function() return { context = { authtoken = "csrf-test-token" } } end
 package.preload["luci.model.uci"] = function() return { cursor = function() return uci end } end
+-- The controller streams through luci.ltn12.pump.all() under luci.util.copcall().
+-- Load the faithful fixtures (real LuCI 22.03 ltn12 + the Kepler coxpcall
+-- algorithm) so the download path is exercised exactly as on-device.
+package.preload["luci.ltn12"] = function()
+	assert(loadfile(root .. "/tests/fixtures/luci/ltn12.lua"))()
+	return package.loaded["luci.ltn12"]
+end
+package.preload["luci.util"] = function()
+	return assert(dofile(root .. "/tests/fixtures/luci/util-copcall.lua"))
+end
 
 assert(loadfile(controller_path))()
 local controller = assert(package.loaded["luci.controller.glinet_crossmodel"])
