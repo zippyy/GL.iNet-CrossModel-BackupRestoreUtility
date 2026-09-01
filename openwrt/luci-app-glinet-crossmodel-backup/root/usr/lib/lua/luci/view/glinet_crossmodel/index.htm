@@ -42,7 +42,7 @@ local csrf_token = tostring(token or "")
             <div class="gcm-field"><label for="profile-name">Profile name</label><input id="profile-name" class="gcm-input" maxlength="100" value="Router backup"></div>
             <div class="gcm-field"><label for="profile-notes">Notes</label><input id="profile-notes" class="gcm-input" maxlength="1000" placeholder="Purpose, site, or recovery context"></div>
             <div class="gcm-field full"><label>Configuration selection</label><div id="categories" class="gcm-categories"></div></div>
-            <div class="gcm-field"><label for="custom-files">Explicit custom files/scripts</label><textarea id="custom-files" class="gcm-input" placeholder="/root/recovery-hook.sh&#10;/etc/rc.local"></textarea></div>
+            <div class="gcm-field"><label for="custom-files">Explicit custom files/directories</label><textarea id="custom-files" class="gcm-input" placeholder="/etc/custom.conf&#10;/etc/geoip-shell&#10;/root/scripts"></textarea><small>Enter absolute file or directory paths, one per line. Directories are included recursively. Symlinks are not followed.</small></div>
             <div class="gcm-field"><label for="custom-binaries">Explicit ELF binaries</label><textarea id="custom-binaries" class="gcm-input" placeholder="/usr/local/bin/custom-helper"></textarea></div>
           </div>
           <div class="gcm-actions"><button id="create-profile" class="gcm-button primary">Create backup from selected scope</button></div>
@@ -116,7 +116,7 @@ local csrf_token = tostring(token or "")
   var base='<%=base%>';
   var csrf=<%=jsonc.stringify(csrf_token)%>;
   var app=document.getElementById('gcm-app');
-  var categoryDefs=[['wifi','Wi-Fi'],['lan','LAN'],['dhcp','DHCP & reservations'],['dns','DNS'],['firewall','Firewall & forwards'],['timezone','Timezone'],['ddns','Dynamic DNS'],['vpn','VPN structure'],['packages','Packages'],['persistent','Persistent files'],['custom-files','Custom files'],['custom-binaries','ELF binaries']];
+  var categoryDefs=[['wifi','Wi-Fi'],['lan','LAN'],['dhcp','DHCP & reservations'],['dns','DNS'],['firewall','Firewall & forwards'],['timezone','Timezone'],['ddns','Dynamic DNS'],['vpn','VPN structure'],['packages','Packages'],['persistent','Persistent files'],['custom-files','Custom files/directories'],['custom-binaries','ELF binaries']];
   var state={routers:[],profiles:[],selectedProfile:null,lastPlan:null,planKey:'',lastFocus:null,packageSelection:{},dangerousOverride:false};
   function byId(id){return document.getElementById(id);}
   function escapeHtml(value){return String(value==null?'':value).replace(/[&<>"']/g,function(character){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[character];});}

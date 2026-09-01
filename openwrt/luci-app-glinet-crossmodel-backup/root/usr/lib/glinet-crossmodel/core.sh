@@ -1110,30 +1110,82 @@ gcm_capture_persistent() {
 	done < "$discovered"
 }
 
-gcm_validate_custom_list() {
-	input=$1
+# Walk an explicitly selected tree without following symlinks.  The glob
+# patterns deliberately include dot-files; unlike find, this is POSIX/BusyBox
+# ash compatible and lets us retain empty directories in the staging tree.
+gcm_custom_walk() {
+	path=$1
 	output=$2
-	binary_only=$3
-	total_file=$4
-	: > "$output"
-	[ -f "$input" ] || return 0
-	while IFS= read -r path || [ -n "$path" ]; do
-		[ -n "$path" ] || continue
-		gcm_safe_absolute_path "$path" >/dev/null || { gcm_die "Unsafe custom path: $path"; return 1; }
-		[ -f "$path" ] && [ ! -L "$path" ] || { gcm_die "Custom path is not a regular file: $path"; return 1; }
+	dirs=$3
+	binary_only=$4
+	total_file=$5
+	depth=${6:-0}
+	[ "$depth" -le 64 ] || { gcm_die "Custom directory recursion is too deep: $path"; return 1; }
+	if [ -L "$path" ]; then
+		gcm_diag WARN "action=${GCM_ACTION:-create}" 'stage=custom-files' "path=$path" 'result=skipped' 'reason=symlink-not-followed'
+		return 0
+	fi
+	if [ -d "$path" ]; then
+		case "$(cat "$dirs" 2>/dev/null)" in *"|$path|"*) ;; esac
+		# The directory list is also the duplicate/overlap ledger.
+		grep -F -x "$path" "$dirs" >/dev/null 2>&1 || printf '%s\n' "$path" >> "$dirs"
+		for child in "$path"/* "$path"/.[!.]* "$path"/..?*; do
+			[ -e "$child" ] || [ -L "$child" ] || continue
+			gcm_custom_walk "$child" "$output" "$dirs" "$binary_only" "$total_file" $((depth + 1)) || return 1
+		done
+		return 0
+	fi
+	if [ -f "$path" ]; then
+		[ ! -L "$path" ] || { gcm_diag WARN "action=${GCM_ACTION:-create}" 'stage=custom-files' "path=$path" 'result=skipped' 'reason=symlink-not-followed'; return 0; }
+		# The archive destination is the absolute source path below artifacts/*.
+		# De-duplicate before charging limits, so overlapping selections are safe.
+		grep -F -x "$path" "$output" >/dev/null 2>&1 && return 0
 		size=$(wc -c < "$path" | tr -d ' ')
 		case "$size" in ''|*[!0-9]*) gcm_die "Could not size custom file: $path"; return 1 ;; esac
 		[ "$size" -le "$GCM_MAX_FILE_BYTES" ] || { gcm_die "Custom file exceeds the per-file limit: $path"; return 1; }
 		total=$(cat "$total_file")
 		total=$((total + size))
-		[ "$total" -le "$GCM_MAX_TOTAL_BYTES" ] || { gcm_die 'Custom files exceed the total size limit.'; return 1; }
+		[ "$total" -le "$GCM_MAX_TOTAL_BYTES" ] || { gcm_die 'Custom selection exceeds the total size limit.'; return 1; }
 		printf '%s\n' "$total" > "$total_file"
 		if [ "$binary_only" = 1 ]; then
 			magic=$(dd if="$path" bs=4 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n')
 			[ "$magic" = 7f454c46 ] || { gcm_die "Custom binary is not ELF: $path"; return 1; }
 		fi
 		printf '%s\n' "$path" >> "$output"
+		return 0
+	fi
+	gcm_die "Custom path type is not supported: $path"
+	return 1
+}
+
+gcm_validate_custom_list() {
+	input=$1
+	output=$2
+	binary_only=$3
+	total_file=$4
+	dirs=$5
+	: > "$output"
+	: > "$dirs"
+	[ -f "$input" ] || return 0
+	while IFS= read -r path || [ -n "$path" ]; do
+		[ -n "$path" ] || continue
+		gcm_safe_absolute_path "$path" >/dev/null || { gcm_die "Unsafe custom path: $path"; return 1; }
+		[ -e "$path" ] || [ -L "$path" ] || { gcm_die "Custom path does not exist: $path"; return 1; }
+		[ ! -L "$path" ] || { gcm_die "Custom path is a symlink: $path"; return 1; }
+		gcm_custom_walk "$path" "$output" "$dirs" "$binary_only" "$total_file" || return 1
 	done < "$input"
+}
+
+gcm_copy_custom_tree() {
+	tree=$1
+	destination_root=$2
+	dirs=$3
+	[ -f "$dirs" ] || return 0
+	while IFS= read -r path || [ -n "$path" ]; do
+		[ -n "$path" ] || continue
+		relative=${path#/}
+		mkdir -p "$destination_root/$relative" || return 1
+	done < "$dirs"
 }
 
 gcm_capture_custom() {
@@ -1141,12 +1193,15 @@ gcm_capture_custom() {
 	scripts_input=$2
 	binaries_input=$3
 	work=$4
+	mkdir -p "$work" || return 1
 	total="$work/custom-total"
 	printf '0\n' > "$total"
-	gcm_validate_custom_list "$scripts_input" "$work/scripts.list" 0 "$total" || return 1
-	gcm_validate_custom_list "$binaries_input" "$work/binaries.list" 1 "$total" || return 1
-	while IFS= read -r path || [ -n "$path" ]; do [ -n "$path" ] && gcm_copy_with_root "$path" "$prefix_dir/artifacts/files"; done < "$work/scripts.list"
-	while IFS= read -r path || [ -n "$path" ]; do [ -n "$path" ] && gcm_copy_with_root "$path" "$prefix_dir/artifacts/binaries"; done < "$work/binaries.list"
+	gcm_validate_custom_list "$scripts_input" "$work/scripts.list" 0 "$total" "$work/scripts.dirs" || return 1
+	gcm_validate_custom_list "$binaries_input" "$work/binaries.list" 1 "$total" "$work/binaries.dirs" || return 1
+	gcm_copy_custom_tree "$work/scripts.dirs" "$prefix_dir/artifacts/files" "$work/scripts.dirs" || return 1
+	gcm_copy_custom_tree "$work/binaries.dirs" "$prefix_dir/artifacts/binaries" "$work/binaries.dirs" || return 1
+	while IFS= read -r path || [ -n "$path" ]; do [ -n "$path" ] && gcm_copy_with_root "$path" "$prefix_dir/artifacts/files" || return 1; done < "$work/scripts.list"
+	while IFS= read -r path || [ -n "$path" ]; do [ -n "$path" ] && gcm_copy_with_root "$path" "$prefix_dir/artifacts/binaries" || return 1; done < "$work/binaries.list"
 }
 
 gcm_write_manifest() {
@@ -2113,16 +2168,44 @@ gcm_apply_extra_tree() {
 	done
 }
 
+gcm_restore_mkdir_safe() {
+	root=$1
+	relative=$2
+	[ "$relative" = . ] && return 0
+	case "$relative" in ''|/*) return 1 ;; esac
+	current=${root%/}
+	remaining=$relative
+	while [ -n "$remaining" ]; do
+		component=${remaining%%/*}
+		if [ "$remaining" = "$component" ]; then remaining=''; else remaining=${remaining#*/}; fi
+		case "$component" in ''|.|..) return 1 ;; esac
+		current="$current/$component"
+		[ ! -L "$current" ] || return 1
+		if [ -e "$current" ] && [ ! -d "$current" ]; then return 1; fi
+		[ -d "$current" ] || mkdir "$current" || return 1
+	done
+}
+
 gcm_apply_custom_tree() {
 	tree=$1
 	destination_root=$2
 	label=$3
 	[ -d "$tree" ] || return 0
+	# Apply directory entries first so explicitly selected empty directories
+	# survive the round trip.  Reject symlink components before mkdir/cp: a
+	# hostile target filesystem must not redirect a restore outside its root.
+	find "$tree" -type d | sort | while IFS= read -r source; do
+		relative=${source#"$tree"/}
+		[ "$source" = "$tree" ] && continue
+		gcm_safe_member "$relative" || exit 1
+		gcm_restore_mkdir_safe "$destination_root" "$relative" || exit 1
+	done || return 1
 	find "$tree" -type f | while IFS= read -r source; do
 		relative=${source#"$tree"/}
 		gcm_safe_member "$relative" || exit 1
 		destination="$destination_root/$relative"
-		mkdir -p "$(dirname "$destination")" || exit 1
+		gcm_restore_mkdir_safe "$destination_root" "$(dirname "$relative")" || exit 1
+		[ ! -L "$destination" ] || { gcm_log "SKIPPED=$label:$destination:destination-symlink"; exit 1; }
 		cp -p "$source" "$destination" || exit 1
 		gcm_log "APPLIED=$label:$destination"
 	done

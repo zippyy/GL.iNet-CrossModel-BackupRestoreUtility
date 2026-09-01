@@ -25,7 +25,7 @@ make_v2() {
 	tar -C "$work" -czf "$archive" glinet-crossmodel
 }
 
-printf '1..50\n'
+printf '1..59\n'
 
 assert_true gcm_safe_member 'glinet-crossmodel/manifest.json'
 assert_false gcm_safe_member '../etc/shadow'
@@ -176,4 +176,42 @@ ok 'activate applies staged network file'
 ok 'activate places staged network file at target config path'
 [ -f "$staged/firewall" ] && fail 'activate applies staged firewall file'
 ok 'activate applies staged firewall file'
+
+# --- Explicit custom directory collection and safe restore ---
+custom_source="$TEST_ROOT/custom-tree"
+custom_stage="$TEST_ROOT/custom-stage/glinet-crossmodel"
+custom_input="$TEST_ROOT/custom-input"
+mkdir -p "$custom_source/scripts" "$custom_source/data/nested" "$custom_source/empty" "$custom_stage" "$custom_input"
+printf 'config-value\n' > "$custom_source/config"
+printf '#!/bin/sh\necho update\n' > "$custom_source/scripts/update.sh"
+printf 'nested-data\n' > "$custom_source/data/nested/file.txt"
+printf '%s\n' "$custom_source" > "$custom_input/files"
+mkdir -p "$custom_input/work"
+gcm_capture_custom "$custom_stage" "$custom_input/files" "$custom_input/no-binaries" "$custom_input/work" || fail 'collects explicit directory recursively'
+[ -f "$custom_stage/artifacts/files$custom_source/config" ] || fail 'stages directory root file without flattening'; ok 'stages directory root file without flattening'
+[ -f "$custom_stage/artifacts/files$custom_source/data/nested/file.txt" ] || fail 'stages nested directory file'; ok 'stages nested directory file'
+[ -d "$custom_stage/artifacts/files$custom_source/empty" ] || fail 'stages empty directory'; ok 'stages empty directory'
+ln -s /etc/passwd "$custom_source/passwd-link"
+[ ! -f "$custom_stage/artifacts/files$custom_source/passwd-link" ] || fail 'does not follow directory symlink'; ok 'does not follow directory symlink'
+printf '%s\n%s\n' "$custom_source" "$custom_source/config" > "$custom_input/overlap"
+rm -rf "$custom_stage"; mkdir -p "$custom_stage"
+gcm_capture_custom "$custom_stage" "$custom_input/overlap" "$custom_input/no-binaries" "$custom_input/work-overlap" || fail 'accepts overlapping selections';
+[ "$(grep -F -x "$custom_source/config" "$custom_input/work-overlap/scripts.list" | wc -l | tr -d ' ')" = 1 ] || fail 'overlap does not duplicate file'; ok 'overlap does not duplicate file'
+symlink_input="$custom_input/symlink-list"
+ln -s "$custom_source" "$custom_input/selected-symlink"
+printf '%s\n' "$custom_input/selected-symlink" > "$symlink_input"
+if gcm_validate_custom_list "$symlink_input" "$custom_input/rejected" 0 "$custom_input/total" "$custom_input/dirs" >/dev/null 2>&1; then fail 'rejects selected symlink'; fi
+ok 'rejects selected symlink'
+
+restore_target="$TEST_ROOT/custom-restore"
+mkdir -p "$restore_target"
+gcm_apply_custom_tree "$custom_stage/artifacts/files" "$restore_target" custom-file || fail 'restores explicit directory tree safely'
+[ "$(cat "$restore_target$custom_source/data/nested/file.txt")" = nested-data ] || fail 'restored nested content matches'; ok 'restored nested content matches'
+[ -d "$restore_target$custom_source/empty" ] || fail 'restores empty directory'; ok 'restores empty directory'
+mkdir -p "$custom_stage/artifacts/files$custom_source/escape"
+printf 'escape\n' > "$custom_stage/artifacts/files$custom_source/escape/file"
+rm -rf "$restore_target$custom_source/escape"
+ln -s /tmp "$restore_target$custom_source/escape"
+if gcm_apply_custom_tree "$custom_stage/artifacts/files" "$restore_target" custom-file >/dev/null 2>&1; then fail 'rejects destination symlink escape'; fi
+ok 'rejects destination symlink escape'
 rm -rf "$staged" "$staged_target" "$uci_delta_dir" "$rollback_dir" "$rollback_target"
