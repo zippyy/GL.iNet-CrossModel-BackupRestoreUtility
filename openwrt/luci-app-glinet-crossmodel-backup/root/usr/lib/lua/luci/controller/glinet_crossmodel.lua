@@ -260,6 +260,18 @@ local function selected_csv(value)
 	return table.concat(selected, ",")
 end
 
+-- Strict normalization for the destination LAN IP preservation option. Only
+-- explicit booleans and the canonical 0/1 or "0"/"1"/true/false spellings are
+-- accepted; arbitrary truthy strings from the browser are rejected, never
+-- coerced. An absent field (legacy API caller) keeps the historical default
+-- of disabled.
+local function normalize_preserve_flag(value)
+	if value == nil then return "0" end
+	if value == true or value == 1 or value == "1" or value == "true" then return "1" end
+	if value == false or value == 0 or value == "0" or value == "false" then return "0" end
+	return nil
+end
+
 local function load_routers()
 	local parsed = jsonc.parse(fs.readfile(ROUTERS_FILE) or "")
 	return type(parsed) == "table" and parsed or {}
@@ -687,16 +699,23 @@ end
 local function target_call(action, path, input, extra, operation_id)
 	local selected = selected_csv(input.categories)
 	if selected == "" then return false, "Select at least one category.", 400 end
+	local preserve = normalize_preserve_flag(input.preserve_destination_lan_ip)
+	if preserve == nil then return false, "Invalid preserve_destination_lan_ip value.", 400 end
 	if input.scope == "remote" then
 		local connection, connection_error = normalize_connection(input.connection)
 		if not connection then return false, connection_error, 400 end
 		local arguments = { path, operation_id, selected }
 		for _, value in ipairs(extra or {}) do table.insert(arguments, value) end
+		table.insert(arguments, preserve)
 		local ok, output = remote_call(action, arguments, connection, operation_id)
 		return ok, output, ok and 200 or 422
 	end
 	local arguments = { path }
-	if action == "validate" then table.insert(arguments, "--categories"); table.insert(arguments, selected); if extra and extra[1] == "1" then table.insert(arguments, "--dangerous-device-override") end end
+	if action == "validate" then
+		table.insert(arguments, "--categories"); table.insert(arguments, selected)
+		if extra and extra[1] == "1" then table.insert(arguments, "--dangerous-device-override") end
+	end
+	if preserve == "1" then table.insert(arguments, "--preserve-destination-lan-ip") end
 	local ok, output = invoke(CLI, action, arguments, "GCM_OP_ID=" .. quote(operation_id) .. " GCM_SCOPE=local GCM_LOG_LEVEL=" .. quote(configured_log_level()))
 	return ok, output, ok and 200 or 500
 end
@@ -708,7 +727,11 @@ function action_validate()
 	local path, profile_error = require_profile(input)
 	if not path then return write_json({ error = profile_error }, 404) end
 	local override = input.dangerous_override == true and "1" or "0"
-	diagnostic_log("INFO", operation_id, "luci", { action = "validate", stage = "dispatch", scope = input.scope == "remote" and "remote" or "local", profile_id = input.id, dangerous_override = override }, "Validation backend dispatch started")
+	local preserve = normalize_preserve_flag(input.preserve_destination_lan_ip)
+	if preserve == nil then return write_json({ error = "Invalid preserve_destination_lan_ip value." }, 400) end
+	diagnostic_log("INFO", operation_id, "luci", { action = "validate", stage = "dispatch", scope = input.scope == "remote" and "remote" or "local", profile_id = input.id, dangerous_override = override, preserve_destination_lan_ip = preserve }, "Validation backend dispatch started")
+	-- target_call() normalizes preserve_destination_lan_ip from input itself;
+	-- extra carries only the dangerous-device-override.
 	local ok, output, status = target_call("validate", path, input, { override }, operation_id)
 	if not ok then return write_json({ error = trim(output) }, status or 500) end
 	local plan = jsonc.parse(output)
@@ -747,19 +770,22 @@ function action_restore()
 	local direct = input.direct_custom == true and "1" or "0"
 	local override = input.dangerous_override == true and "1" or "0"
 	local allow_legacy = input.allow_legacy == true and "1" or "0"
+	local preserve = normalize_preserve_flag(input.preserve_destination_lan_ip)
+	if preserve == nil then return write_json({ error = "Invalid preserve_destination_lan_ip value." }, 400) end
 	local category_count = 0; for _ in selected:gmatch("[^,]+") do category_count = category_count + 1 end
-	diagnostic_log("INFO", operation_id, "luci", { action = "restore", stage = "dispatch", scope = input.scope == "remote" and "remote" or "local", profile_id = input.id, selected_category_count = category_count, selected_package_count = packages == "" and 0 or select(2, packages:gsub(",", ",")) + 1, direct_custom_files = direct, dangerous_override = override, allow_legacy = allow_legacy }, "Restore request validated; request body and secret-bearing fields omitted")
+	diagnostic_log("INFO", operation_id, "luci", { action = "restore", stage = "dispatch", scope = input.scope == "remote" and "remote" or "local", profile_id = input.id, selected_category_count = category_count, selected_package_count = packages == "" and 0 or select(2, packages:gsub(",", ",")) + 1, direct_custom_files = direct, dangerous_override = override, allow_legacy = allow_legacy, preserve_destination_lan_ip = preserve }, "Restore request validated; request body and secret-bearing fields omitted")
 	local ok, output, status
 	if input.scope == "remote" then
 		local connection, connection_error = normalize_connection(input.connection)
 		if not connection then return write_json({ error = connection_error }, 400) end
-		ok, output = remote_call("restore", { path, operation_id, selected, packages, direct, override, allow_legacy }, connection, operation_id); status = ok and 200 or 422
+		ok, output = remote_call("restore", { path, operation_id, selected, packages, direct, override, allow_legacy, preserve }, connection, operation_id); status = ok and 200 or 422
 	else
 		local arguments = { path, "--categories", selected }
 		if packages ~= "" then table.insert(arguments, "--packages"); table.insert(arguments, packages) end
 		if direct == "1" then table.insert(arguments, "--direct-custom-files") end
 		if override == "1" then table.insert(arguments, "--dangerous-device-override") end
 		if allow_legacy == "1" then table.insert(arguments, "--allow-legacy") end
+		if preserve == "1" then table.insert(arguments, "--preserve-destination-lan-ip") end
 		ok, output = invoke(CLI, "restore", arguments, "GCM_OP_ID=" .. quote(operation_id) .. " GCM_SCOPE=local GCM_LOG_LEVEL=" .. quote(configured_log_level())); status = ok and 200 or 500
 	end
 	if not ok then return write_json({ error = trim(output) ~= "" and trim(output) or "Restore failed." }, status) end

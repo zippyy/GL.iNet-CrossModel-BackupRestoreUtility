@@ -47,15 +47,15 @@ done
 operation_id=33333333-3333-3333-3333-333333333333
 archive="$TEST_ROOT/remote.tar.gz"
 sh "$REMOTE" create "$archive" portable "$operation_id" 'Remote test' 'Mock agentless endpoint' packages "$empty" "$empty" 127.0.0.1 22 root key "$key_file" >/dev/null
-sh "$REMOTE" validate "$archive" "$operation_id" packages 0 127.0.0.1 22 root agent - > "$TEST_ROOT/remote-validate.json"
+sh "$REMOTE" validate "$archive" "$operation_id" packages 0 0 127.0.0.1 22 root agent - > "$TEST_ROOT/remote-validate.json"
 sh "$REMOTE" packages "$archive" "$operation_id" 127.0.0.1 22 root key "$key_file" > "$TEST_ROOT/remote-packages.json"
 "$NODE_BIN" -e 'const fs=require("fs"); JSON.parse(fs.readFileSync(process.argv[1],"utf8")); JSON.parse(fs.readFileSync(process.argv[2],"utf8"));' "$TEST_ROOT/remote-validate.json" "$TEST_ROOT/remote-packages.json"
-GCM_FAKE_SKIP_RESTORE=1 sh "$REMOTE" restore "$archive" "$operation_id" packages '' 0 0 0 127.0.0.1 22 root agent - >/dev/null
+GCM_FAKE_SKIP_RESTORE=1 sh "$REMOTE" restore "$archive" "$operation_id" packages '' 0 0 0 0 127.0.0.1 22 root agent - >/dev/null
 
 if GCM_FAKE_AUTH_FAILURE=1 sh "$REMOTE" facts 127.0.0.1 22 root agent - >/dev/null 2>&1; then echo 'Mock authentication failure unexpectedly succeeded.' >&2; exit 1; fi
 if GCM_FAKE_HOST_MISMATCH=1 sh "$REMOTE" facts 127.0.0.1 22 root agent - >/dev/null 2>&1; then echo 'Mock host fingerprint mismatch unexpectedly succeeded.' >&2; exit 1; fi
-if GCM_FAKE_SCP_FAILURE=1 sh "$REMOTE" validate "$archive" "$operation_id" packages 0 127.0.0.1 22 root agent - >/dev/null 2>&1; then echo 'Mock SCP failure unexpectedly succeeded.' >&2; exit 1; fi
-if GCM_FAKE_CHECKSUM_MISMATCH=1 sh "$REMOTE" validate "$archive" "$operation_id" packages 0 127.0.0.1 22 root agent - >/dev/null 2>&1; then echo 'Mock checksum mismatch unexpectedly succeeded.' >&2; exit 1; fi
+if GCM_FAKE_SCP_FAILURE=1 sh "$REMOTE" validate "$archive" "$operation_id" packages 0 0 127.0.0.1 22 root agent - >/dev/null 2>&1; then echo 'Mock SCP failure unexpectedly succeeded.' >&2; exit 1; fi
+if GCM_FAKE_CHECKSUM_MISMATCH=1 sh "$REMOTE" validate "$archive" "$operation_id" packages 0 0 127.0.0.1 22 root agent - >/dev/null 2>&1; then echo 'Mock checksum mismatch unexpectedly succeeded.' >&2; exit 1; fi
 
 GCM_REMOTE_LIBRARY_ONLY=1 . "$REMOTE"
 [ "$(classify_ssh_error 'Connection timed out')" = timeout ]

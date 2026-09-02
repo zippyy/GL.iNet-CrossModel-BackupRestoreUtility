@@ -59,8 +59,8 @@ usage() {
 Usage:
   glinet-crossmodel-remote facts HOST PORT USER AUTH CREDENTIAL
   glinet-crossmodel-remote create OUTPUT STRATEGY UUID NAME NOTES CATEGORIES SCRIPTS BINARIES HOST PORT USER AUTH CREDENTIAL
-  glinet-crossmodel-remote validate ARCHIVE UUID CATEGORIES OVERRIDE HOST PORT USER AUTH CREDENTIAL
-  glinet-crossmodel-remote restore ARCHIVE UUID CATEGORIES PACKAGES DIRECT OVERRIDE ALLOW_LEGACY HOST PORT USER AUTH CREDENTIAL
+  glinet-crossmodel-remote validate ARCHIVE UUID CATEGORIES OVERRIDE PRESERVE HOST PORT USER AUTH CREDENTIAL
+  glinet-crossmodel-remote restore ARCHIVE UUID CATEGORIES PACKAGES DIRECT OVERRIDE ALLOW_LEGACY PRESERVE HOST PORT USER AUTH CREDENTIAL
   glinet-crossmodel-remote packages ARCHIVE UUID HOST PORT USER AUTH CREDENTIAL
   glinet-crossmodel-remote activate UUID HOST PORT USER AUTH CREDENTIAL
 
@@ -301,22 +301,22 @@ remote_create() {
 }
 
 remote_validate() {
-	[ "$#" -eq 9 ] || usage
-	archive=$1; id=$2; categories=$3; override=$4; host=$5; port=$6; user=$7; auth=$8; credential=$9
+	[ "$#" -eq 10 ] || usage
+	archive=$1; id=$2; categories=$3; override=$4; preserve=$5; host=$6; port=$7; user=$8; auth=$9; credential=${10}
+	case "$preserve" in 1|true|yes) preserve=1 ;; *) preserve=0 ;; esac
 	valid_id "$id" || die 'Invalid operation UUID.'
 	GCM_OP_ID=$id; GCM_ACTION=validate; export GCM_OP_ID GCM_ACTION
 	remote_started=$(date +%s 2>/dev/null || printf 0)
-	gcm_diag INFO 'action=validate' 'stage=start' "host=$host" "port=$port" "user=$user" "auth=$auth" "archive=$archive" "categories=$categories" "dangerous_override=$override" 'msg=Remote validation operation started'
+	gcm_diag INFO 'action=validate' 'stage=start' "host=$host" "port=$port" "user=$user" "auth=$auth" "archive=$archive" "categories=$categories" "dangerous_override=$override" "preserve_destination_lan_ip=$preserve" 'msg=Remote validation operation started'
 	prepare_connection "$host" "$port" "$user" "$auth" "$credential"
 	remote_archive="/tmp/gcm-validate-$id.tar.gz"
 	track_cleanup "$host" "$port" "$user" "$auth" "$credential" "$remote_archive"
 	scp_to_remote "$archive" "$host" "$port" "$user" "$auth" "$credential" "$remote_archive"
 	verify_remote_copy "$archive" "$host" "$port" "$user" "$auth" "$credential" "$remote_archive"
-	if [ "$override" = 1 ]; then
-		if stream_cli "$host" "$port" "$user" "$auth" "$credential" validate "$remote_archive" --categories "$categories" --dangerous-device-override; then status=0; else status=$?; fi
-	else
-		if stream_cli "$host" "$port" "$user" "$auth" "$credential" validate "$remote_archive" --categories "$categories"; then status=0; else status=$?; fi
-	fi
+	set -- validate "$remote_archive" --categories "$categories"
+	[ "$override" = 1 ] && set -- "$@" --dangerous-device-override
+	[ "$preserve" = 1 ] && set -- "$@" --preserve-destination-lan-ip
+	if stream_cli "$host" "$port" "$user" "$auth" "$credential" "$@"; then status=0; else status=$?; fi
 	cleanup_remote "$host" "$port" "$user" "$auth" "$credential" "$remote_archive"
 	clear_cleanup
 	if [ "$status" -eq 0 ]; then gcm_diag INFO 'action=validate' 'stage=complete' "host=$host" "elapsed_seconds=$(gcm_elapsed "$remote_started")" 'result=success'; else gcm_diag ERROR 'action=validate' 'stage=complete' "host=$host" "exit_code=$status" "elapsed_seconds=$(gcm_elapsed "$remote_started")" 'result=failed'; fi
@@ -324,13 +324,14 @@ remote_validate() {
 }
 
 remote_restore() {
-	[ "$#" -eq 12 ] || usage
-	archive=$1; id=$2; categories=$3; packages=$4; direct=$5; override=$6; allow_legacy=$7; host=$8; port=$9
-	shift 9; user=$1; auth=$2; credential=$3
+	[ "$#" -eq 13 ] || usage
+	archive=$1; id=$2; categories=$3; packages=$4; direct=$5; override=$6; allow_legacy=$7; preserve=$8; host=$9; port=${10}
+	shift 10; user=$1; auth=$2; credential=$3
+	case "$preserve" in 1|true|yes) preserve=1 ;; *) preserve=0 ;; esac
 	valid_id "$id" || die 'Invalid operation UUID.'
 	GCM_OP_ID=$id; GCM_ACTION=restore; export GCM_OP_ID GCM_ACTION
 	remote_started=$(date +%s 2>/dev/null || printf 0)
-	gcm_diag INFO 'action=restore' 'stage=start' "host=$host" "port=$port" "user=$user" "auth=$auth" "archive=$archive" "categories=$categories" "direct_custom_files=$direct" "dangerous_override=$override" "allow_legacy=$allow_legacy" "package_selection=$packages" 'msg=Remote restore operation started'
+	gcm_diag INFO 'action=restore' 'stage=start' "host=$host" "port=$port" "user=$user" "auth=$auth" "archive=$archive" "categories=$categories" "direct_custom_files=$direct" "dangerous_override=$override" "allow_legacy=$allow_legacy" "preserve_destination_lan_ip=$preserve" "package_selection=$packages" 'msg=Remote restore operation started'
 	prepare_connection "$host" "$port" "$user" "$auth" "$credential"
 	remote_archive="/tmp/gcm-restore-$id.tar.gz"
 	track_cleanup "$host" "$port" "$user" "$auth" "$credential" "$remote_archive"
@@ -341,6 +342,7 @@ remote_restore() {
 	[ "$direct" = 1 ] && set -- "$@" --direct-custom-files
 	[ "$override" = 1 ] && set -- "$@" --dangerous-device-override
 	[ "$allow_legacy" = 1 ] && set -- "$@" --allow-legacy
+	[ "$preserve" = 1 ] && set -- "$@" --preserve-destination-lan-ip
 	if ! GCM_DEFER_RELOAD=1 stream_cli "$host" "$port" "$user" "$auth" "$credential" "$@"; then
 		cleanup_remote "$host" "$port" "$user" "$auth" "$credential" "$remote_archive"; exit 1
 	fi

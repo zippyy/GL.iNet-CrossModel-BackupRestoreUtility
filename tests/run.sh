@@ -2,6 +2,8 @@
 set -eu
 ROOT=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 sh "$ROOT/tests/test-core.sh"
+sh "$ROOT/tests/test-preserve-lan-ip.sh"
+sh "$ROOT/tests/test-preserve-ui.sh"
 sh "$ROOT/tests/test-security.sh"
 sh "$ROOT/tests/test-controller-security.sh"
 sh "$ROOT/tests/test-csrf-transport.sh"
@@ -17,4 +19,6 @@ sh -n "$ROOT/openwrt/luci-app-glinet-crossmodel-backup/root/usr/libexec/gcm-glui
 sh -n "$ROOT/openwrt/luci-app-glinet-crossmodel-backup/root/usr/libexec/glinet-crossmodel-backup"
 sh -n "$ROOT/openwrt/luci-app-glinet-crossmodel-backup/root/usr/libexec/glinet-crossmodel-validate"
 sh -n "$ROOT/openwrt/luci-app-glinet-crossmodel-backup/root/etc/init.d/gcm-glui-integration"
+sh -n "$ROOT/tests/test-preserve-lan-ip.sh"
+sh -n "$ROOT/tests/test-preserve-ui.sh"
 sh -n "$ROOT/scripts/real-router-smoke.sh"

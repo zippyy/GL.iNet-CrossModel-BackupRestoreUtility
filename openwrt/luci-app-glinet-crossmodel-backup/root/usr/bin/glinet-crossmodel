@@ -19,8 +19,10 @@ Usage:
       [--scripts-list FILE] [--binaries-list FILE]
   glinet-crossmodel inspect ARCHIVE [--human]
   glinet-crossmodel validate ARCHIVE [--categories CSV] [--dangerous-device-override]
+      [--preserve-destination-lan-ip]
   glinet-crossmodel restore ARCHIVE [--categories CSV] [--packages CSV]
       [--direct-custom-files] [--dangerous-device-override] [--allow-legacy]
+      [--preserve-destination-lan-ip]
   glinet-crossmodel packages ARCHIVE
   glinet-crossmodel activate
   glinet-crossmodel version
@@ -99,20 +101,21 @@ case "$command" in
 		;;
 	validate)
 		[ "$#" -ge 1 ] || usage
-		archive=$1; shift; categories=$all_categories; override=0
+		archive=$1; shift; categories=$all_categories; override=0; preserve_ip=0
 		while [ "$#" -gt 0 ]; do
 			case "$1" in
 				--categories) [ "$#" -ge 2 ] || usage; categories=$2; shift 2 ;;
 				--dangerous-device-override) override=1; shift ;;
+				--preserve-destination-lan-ip) preserve_ip=1; shift ;;
 				# Legacy controller positional category argument.
 				*) if [ "$#" -eq 1 ] && [ "${1#--}" = "$1" ]; then categories=$1; shift; else usage; fi ;;
 			esac
 		done
-		gcm_validate "$archive" "$categories" "$override"
+		gcm_validate "$archive" "$categories" "$override" "$preserve_ip"
 		;;
 	restore)
 		[ "$#" -ge 1 ] || usage
-		archive=$1; shift; categories=$all_categories; packages=''; direct=0; override=0; allow_legacy=0
+		archive=$1; shift; categories=$all_categories; packages=''; direct=0; override=0; allow_legacy=0; preserve_ip=0
 		# Legacy controller shape: ARCHIVE CATEGORIES INSTALL_ALL DIRECT. The
 		# install-all flag is intentionally ignored; v2 requires explicit names.
 		if [ "$#" -eq 3 ] && [ "${1#--}" = "$1" ]; then
@@ -125,10 +128,11 @@ case "$command" in
 				--direct-custom-files) direct=1; shift ;;
 				--dangerous-device-override) override=1; shift ;;
 				--allow-legacy) allow_legacy=1; shift ;;
+				--preserve-destination-lan-ip) preserve_ip=1; shift ;;
 				*) usage ;;
 			esac
 		done
-		gcm_restore "$archive" "$categories" "$packages" "$direct" "$override" "$allow_legacy"
+		gcm_restore "$archive" "$categories" "$packages" "$direct" "$override" "$allow_legacy" "$preserve_ip"
 		;;
 	packages)
 		[ "$#" -eq 1 ] || usage

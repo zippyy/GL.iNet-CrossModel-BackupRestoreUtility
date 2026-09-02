@@ -751,6 +751,281 @@ gcm_portable_add() {
 
 gcm_uci_get() { uci -q get "$1" 2>/dev/null || true; }
 
+# --- Destination LAN IP preservation policy -------------------------------
+# Restore is a destination-side policy: when preserve_destination_lan_ip is
+# enabled the target's current network.lan.ipaddr is captured before any
+# mutation and re-applied to every staged/committed network configuration, so
+# a restore can never strand the administrator on an unreachable management
+# address. Only the primary network.lan.ipaddr is preserved. Everything else
+# (netmask, DHCP, DNS, other interfaces) restores under existing semantics.
+
+# Strict dotted-quad IPv4 validation. BusyBox/POSIX safe; no external
+# dependencies. Rejects empty values, whitespace, hostnames, IPv6, ranges,
+# extra or missing octets, and out-of-range octets.
+gcm_valid_ipv4() {
+	_value=$1
+	case "$_value" in
+		''|*[!0-9.]*|*..*|.*|*.) return 1 ;;
+	esac
+	printf '%s\n' "$_value" | awk -F. '
+		NF == 4 {
+			for (i = 1; i <= 4; i++) {
+				if ($i !~ /^[0-9]+$/ || $i + 0 > 255) exit 1
+			}
+			exit 0
+		}
+		{ exit 1 }
+	'
+}
+
+# Read a single option value from a UCI-format file (the shape produced by
+# uci export / uci show). want_name may be empty to match any section of the
+# wanted type. Only the first matching section is consulted.
+gcm_uci_file_option() {
+	file=$1
+	want_type=$2
+	want_name=$3
+	want_option=$4
+	[ -f "$file" ] || return 0
+	awk -v wtype="$want_type" -v wname="$want_name" -v woption="$want_option" '
+		BEGIN { squote = sprintf("%c", 39); dquote = sprintf("%c", 34) }
+		function clean(value) {
+			gsub(squote, "", value)
+			gsub(dquote, "", value)
+			return value
+		}
+		/^[[:space:]]*config[[:space:]]+/ {
+			rest = $0
+			sub(/^[[:space:]]*config[[:space:]]+/, "", rest)
+			type = rest
+			sub(/[[:space:]].*/, "", type)
+			name = ""
+			if (rest ~ /[[:space:]]/) {
+				name = rest
+				sub(/^[^[:space:]]*[[:space:]]+/, "", name)
+				name = clean(name)
+			}
+			in_section = (type == wtype)
+			if (wname != "") in_section = in_section && (name == wname)
+			next
+		}
+		in_section && $0 ~ "^[[:space:]]*option[[:space:]]+" woption "([[:space:]]|$)" {
+			value = $0
+			sub(/^[[:space:]]*option[[:space:]]+[^[:space:]]+[[:space:]]+/, "", value)
+			print clean(value)
+			exit
+		}
+	' "$file"
+}
+
+# Primary LAN address carried by a raw /etc/config/network style file.
+gcm_file_lan_ipaddr() {
+	file=$1
+	[ -f "$file" ] || return 0
+	gcm_uci_file_option "$file" interface lan ipaddr
+}
+
+# Sweep every "option ip" value across all sections of the wanted type in a
+# UCI-format file (used for static-reservation conflict warnings).
+gcm_uci_file_type_ips() {
+	file=$1
+	want_type=$2
+	[ -f "$file" ] || return 0
+	awk -v wtype="$want_type" '
+		BEGIN { squote = sprintf("%c", 39); dquote = sprintf("%c", 34) }
+		function clean(value) {
+			gsub(squote, "", value)
+			gsub(dquote, "", value)
+			return value
+		}
+		/^[[:space:]]*config[[:space:]]+/ {
+			rest = $0
+			sub(/^[[:space:]]*config[[:space:]]+/, "", rest)
+			type = rest
+			sub(/[[:space:]].*/, "", type)
+			in_section = (type == wtype)
+			next
+		}
+		in_section && /^[[:space:]]*option[[:space:]]+ip([[:space:]]|$)/ {
+			value = $0
+			sub(/^[[:space:]]*option[[:space:]]+[^[:space:]]+[[:space:]]+/, "", value)
+			print clean(value)
+		}
+	' "$file"
+}
+
+# Rewrite the ipaddr option of the primary "config interface 'lan'" section
+# in a raw UCI file, inserting the option when the section has none. This is
+# used on the staged network package BEFORE it is copied into place so the
+# source backup address never becomes the committed or staged destination
+# address when preservation is enabled. Other interfaces and options are
+# never touched.
+gcm_file_force_lan_ipaddr() {
+	file=$1
+	forced_ip=$2
+	[ -f "$file" ] || return 1
+	gcm_valid_ipv4 "$forced_ip" || return 1
+	rewrite_temp=$(mktemp /tmp/gcm-lan-ip.XXXXXX) || return 1
+	# First pass: replace an existing ipaddr option on the primary lan
+	# interface. Exit 2 signals the LAN interface exists but has no ipaddr,
+	# which the second pass then handles by inserting the option. Each awk
+	# status is captured with the invocation guarded in an if condition:
+	# under `set -e` a bare failing command followed by rc=$? would terminate
+	# the shell before temp cleanup and before the insert fallback could run.
+	if awk -v forced="$forced_ip" '
+		BEGIN { squote = sprintf("%c", 39); dquote = sprintf("%c", 34); written = 0 }
+		function clean(value) {
+			gsub(squote, "", value)
+			gsub(dquote, "", value)
+			return value
+		}
+		/^[[:space:]]*config[[:space:]]+/ {
+			rest = $0
+			sub(/^[[:space:]]*config[[:space:]]+/, "", rest)
+			type = rest
+			sub(/[[:space:]].*/, "", type)
+			name = ""
+			if (rest ~ /[[:space:]]/) {
+				name = rest
+				sub(/^[^[:space:]]*[[:space:]]+/, "", name)
+				name = clean(name)
+			}
+			in_lan = (type == "interface" && name == "lan")
+			print
+			next
+		}
+		in_lan && /^[[:space:]]*option[[:space:]]+ipaddr([[:space:]]|$)/ {
+			printf "\toption ipaddr %c%s%c\n", squote, forced, squote
+			written = 1
+			next
+		}
+		{ print }
+		END { exit written ? 0 : 2 }
+	' "$file" > "$rewrite_temp"; then
+		rewrite_rc=0
+	else
+		rewrite_rc=$?
+	fi
+	if [ "$rewrite_rc" -eq 0 ]; then
+		cp -p "$rewrite_temp" "$file" 2>/dev/null || { rm -f "$rewrite_temp"; return 1; }
+		rm -f "$rewrite_temp"
+		return 0
+	fi
+	rm -f "$rewrite_temp"
+	[ "$rewrite_rc" -eq 2 ] || return 1
+	# The LAN interface exists but has no ipaddr option; insert one right
+	# after its config header so the section stays coherent.
+	insert_temp=$(mktemp /tmp/gcm-lan-ip.XXXXXX) || return 1
+	if awk -v forced="$forced_ip" '
+		BEGIN { squote = sprintf("%c", 39); dquote = sprintf("%c", 34); inserted = 0 }
+		function clean(value) {
+			gsub(squote, "", value)
+			gsub(dquote, "", value)
+			return value
+		}
+		/^[[:space:]]*config[[:space:]]+/ {
+			rest = $0
+			sub(/^[[:space:]]*config[[:space:]]+/, "", rest)
+			type = rest
+			sub(/[[:space:]].*/, "", type)
+			name = ""
+			if (rest ~ /[[:space:]]/) {
+				name = rest
+				sub(/^[^[:space:]]*[[:space:]]+/, "", name)
+				name = clean(name)
+			}
+			print
+			if (type == "interface" && name == "lan" && !inserted) {
+				printf "\toption ipaddr %c%s%c\n", squote, forced, squote
+				inserted = 1
+			}
+			next
+		}
+		{ print }
+		END { exit inserted ? 0 : 1 }
+	' "$file" > "$insert_temp"; then
+		insert_rc=0
+	else
+		insert_rc=$?
+	fi
+	if [ "$insert_rc" -eq 0 ]; then
+		cp -p "$insert_temp" "$file" 2>/dev/null || { rm -f "$insert_temp"; return 1; }
+		rm -f "$insert_temp"
+		return 0
+	fi
+	rm -f "$insert_temp"
+	return 1
+}
+
+
+# Capture the destination router's current primary LAN address. This runs in
+# the target execution context (local CLI or streamed remote runtime), never
+# on the controller. The captured value is immutable restore-state for the
+# operation and is stored in GCM_DESTINATION_LAN_IP.
+gcm_capture_destination_lan_ip() {
+	GCM_DESTINATION_LAN_IP=''
+	destination_raw=$(gcm_uci_get network.lan.ipaddr)
+	destination_raw=$(printf '%s' "$destination_raw" | tr -d '\r\n')
+	destination_raw=$(gcm_trim "$destination_raw")
+	case "$destination_raw" in
+		''|*[!0-9A-Za-z.:]*) destination_raw='' ;;
+	esac
+	if ! gcm_valid_ipv4 "$destination_raw"; then
+		gcm_diag WARN "action=${GCM_ACTION:-restore}" 'stage=preserve-lan-ip' 'destination_lan_ip=unavailable' 'result=capture-failed' 'reason=missing-or-invalid' 'msg=Cannot preserve destination LAN IP because network.lan.ipaddr is not defined or is invalid on the target.'
+		return 1
+	fi
+	GCM_DESTINATION_LAN_IP=$destination_raw
+	gcm_diag INFO "action=${GCM_ACTION:-restore}" 'stage=preserve-lan-ip' "destination_lan_ip=$GCM_DESTINATION_LAN_IP" 'result=captured' 'msg=Destination LAN IP captured for preservation'
+	return 0
+}
+
+# Post-apply verification that the staged/committed configuration still
+# carries the preserved destination address. For remote-safe restores over an
+# active SSH session the network package is staged rather than committed, so
+# the staged file itself is inspected. Failures roll back like any other
+# apply failure; the pre-restore snapshot baseline is never modified.
+gcm_verify_destination_lan_ip() {
+	verify_strategy=$1
+	[ "${GCM_PRESERVE_DESTINATION_LAN_IP:-0}" = 1 ] || return 0
+	# Nothing was captured (e.g. the backup or selection cannot change the LAN
+	# address), so there is nothing to verify.
+	[ -n "${GCM_DESTINATION_LAN_IP:-}" ] || return 0
+	verified=''
+	if [ "$verify_strategy" = remote-safe ] && [ -n "${SSH_CONNECTION:-}" ]; then
+		staged_root=${GCM_STAGED_ROOT:-/root/glinet-crossmodel/pending-remote-safe}
+		[ -f "$staged_root/network" ] && verified=$(gcm_file_lan_ipaddr "$staged_root/network")
+	else
+		verified=$(gcm_uci_get network.lan.ipaddr)
+	fi
+	if [ "$verified" != "$GCM_DESTINATION_LAN_IP" ]; then
+		gcm_diag ERROR "action=${GCM_ACTION:-restore}" 'stage=preserve-lan-ip' "destination_lan_ip=$GCM_DESTINATION_LAN_IP" "staged_lan_ip=${verified:-missing}" 'result=failed' 'reason=preserved-ip-mismatch' 'msg=Staged configuration lost the preserved destination LAN IP'
+		return 1
+	fi
+	gcm_diag INFO "action=${GCM_ACTION:-restore}" 'stage=preserve-lan-ip' "destination_lan_ip=$GCM_DESTINATION_LAN_IP" 'result=verified' 'msg=Staged configuration retains the preserved destination LAN IP'
+	return 0
+}
+
+# Compare two addresses under a netmask by dotted-quad bitwise AND.
+gcm_ipv4_same_subnet() {
+	address_a=$1
+	address_b=$2
+	address_mask=$3
+	gcm_valid_ipv4 "$address_a" || return 1
+	gcm_valid_ipv4 "$address_b" || return 1
+	gcm_valid_ipv4 "$address_mask" || return 1
+	# Split the three validated dotted quads into twelve octet variables with
+	# a single IFS read (the last four are the netmask octets). Eval-free and
+	# split-safe: no dynamic variable names and no unquoted word splitting.
+	IFS=. read -r a1 a2 a3 a4 b1 b2 b3 b4 m1 m2 m3 m4 <<EOF
+$address_a.$address_b.$address_mask
+EOF
+	[ $((a1 & m1)) -eq $((b1 & m1)) ] || return 1
+	[ $((a2 & m2)) -eq $((b2 & m2)) ] || return 1
+	[ $((a3 & m3)) -eq $((b3 & m3)) ] || return 1
+	[ $((a4 & m4)) -eq $((b4 & m4)) ] || return 1
+	return 0
+}
+
 gcm_uci_type_count() {
 	count_package=$1
 	count_type=$2
@@ -1524,10 +1799,19 @@ gcm_validate() {
 	archive=$1
 	categories=${2:-wifi,lan,dhcp,dns,firewall,timezone,ddns,vpn,packages,persistent,custom-files,custom-binaries}
 	dangerous_override=${3:-0}
+	preserve_destination_lan_ip=${4:-0}
+	case "$preserve_destination_lan_ip" in 1|true|yes) preserve_destination_lan_ip=1 ;; *) preserve_destination_lan_ip=0 ;; esac
+	# Defensive state reset: validation can be invoked repeatedly inside one
+	# shell process (restore runs a mandatory validation first, and the API
+	# may re-validate without exec). GCM_DESTINATION_LAN_IP is captured below
+	# only when this archive/selection can actually change the LAN address;
+	# without an explicit reset a stale value from an earlier operation could
+	# leak into the plan when no capture happens.
+	GCM_DESTINATION_LAN_IP=''
 	[ "${GCM_ACTION:-}" = validate ] || gcm_prepare_operation validate
 	previous_component=$GCM_COMPONENT; GCM_COMPONENT=validation
 	validate_started=$(date +%s 2>/dev/null || printf 0)
-	gcm_diag INFO 'action=validate' 'stage=start' "archive=$archive" "categories=$categories" "dangerous_override=$dangerous_override" 'msg=Archive validation started'
+	gcm_diag INFO 'action=validate' 'stage=start' "archive=$archive" "categories=$categories" "dangerous_override=$dangerous_override" "preserve_destination_lan_ip=$preserve_destination_lan_ip" 'msg=Archive validation started'
 	categories=$(gcm_valid_categories "$categories") || { gcm_die 'Invalid validation categories.'; return 1; }
 	work=$(mktemp -d /tmp/gcm-validate.XXXXXX) || return 1
 	kind=$(gcm_extract_archive "$archive" "$work/archive") || { rm -rf "$work"; return 1; }
@@ -1602,6 +1886,34 @@ gcm_validate() {
 	if [ "$strategy" != portable ] && [ "$strategy" != legacy-portable ] && [ "$source_kernel" != "$target_kernel" ]; then
 		gcm_add_result "$warn" "Kernel differs: source=$source_kernel target=$target_kernel. Kernel modules will never be installed automatically."
 	fi
+	# Determine whether this restore can change the destination's primary LAN
+	# address and, if so, the backed-up address it would otherwise apply. The
+	# destination LAN IP preservation option is evaluated only where it is
+	# meaningful: a LAN selection plus a backed-up address.
+	backup_lan_ip=''
+	lan_restore_possible=0
+	if gcm_has_category "$categories" lan; then
+		case "$strategy" in
+			portable)
+				plan_portable_file="$prefix_dir/portable/profile"
+				if [ -f "$plan_portable_file" ] && [ "$(gcm_file_count_type "$plan_portable_file" lan)" -gt 0 ]; then
+					backup_lan_ip=$(gcm_uci_file_option "$plan_portable_file" lan '' address)
+					gcm_valid_ipv4 "$backup_lan_ip" && lan_restore_possible=1 || backup_lan_ip=''
+				fi
+				;;
+			clone|remote-safe|snapshot)
+				plan_network_file="$prefix_dir/uci/network"
+				if [ -f "$plan_network_file" ]; then
+					# A raw network package is restored as a whole file, so its
+					# presence alone can replace (or strip) the target LAN
+					# address even when it carries no usable backed-up value.
+					lan_restore_possible=1
+					backup_lan_ip=$(gcm_file_lan_ipaddr "$plan_network_file")
+					gcm_valid_ipv4 "$backup_lan_ip" || backup_lan_ip=''
+				fi
+				;;
+		esac
+	fi
 	if [ "$strategy" = portable ]; then
 		portable="$prefix_dir/portable/profile"
 		if gcm_has_category "$categories" wifi; then
@@ -1617,7 +1929,13 @@ gcm_validate() {
 		fi
 		gcm_add_result "$preserve" 'Physical Ethernet assignments, switch/DSA topology, board interface names, and factory identity are never imported.'
 		[ -d "$prefix_dir/portable/vpn" ] && gcm_add_result "$adapt" 'VPN structural configuration will be mapped only to matching target packages; private keys and device identity remain target-local.'
-		if gcm_has_category "$categories" lan && [ "$(gcm_file_count_type "$portable" lan)" -gt 0 ]; then gcm_add_result "$will" 'Logical LAN protocol, address, netmask, gateway, and DNS values will apply without physical topology.'; fi
+		if gcm_has_category "$categories" lan && [ "$(gcm_file_count_type "$portable" lan)" -gt 0 ]; then
+			if [ "$lan_restore_possible" = 1 ] && [ "$preserve_destination_lan_ip" = 1 ]; then
+				gcm_add_result "$will" 'Logical LAN protocol, netmask, gateway, and DNS values will apply without physical topology; the backed-up address is preserved by the destination LAN IP policy.'
+			else
+				gcm_add_result "$will" 'Logical LAN protocol, address, netmask, gateway, and DNS values will apply without physical topology.'
+			fi
+		fi
 		if gcm_has_category "$categories" dhcp; then gcm_add_result "$will" "DHCP settings and $(gcm_file_count_type "$portable" reservation) static reservation(s) will apply semantically."; fi
 		if gcm_has_category "$categories" dns && [ "$(gcm_file_count_type "$portable" dns)" -gt 0 ]; then gcm_add_result "$will" 'Portable dnsmasq DNS settings will apply to the target DNS section.'; fi
 		if gcm_has_category "$categories" timezone && [ "$(gcm_file_count_type "$portable" timezone)" -gt 0 ]; then gcm_add_result "$will" 'Timezone and zone name will apply.'; fi
@@ -1628,6 +1946,9 @@ gcm_validate() {
 		[ -n "$peer" ] && route=$(ip route get "$peer" 2>/dev/null | sed -n '1p' || true)
 		gcm_add_result "$preserve" 'Dropbear, authorized_keys, ZeroTier, Tailscale, GoodCloud, rtty, and WAN-access state remain target-local.'
 		if [ -n "$route" ]; then gcm_add_result "$preserve" "Current management route detected and protected: $route"; else gcm_add_result "$warn" 'The active SSH management route could not be resolved; connectivity-affecting reloads remain deferred.'; fi
+		if [ "$lan_restore_possible" = 1 ] && [ "$preserve_destination_lan_ip" = 1 ]; then
+			gcm_add_result "$preserve" 'The backed-up LAN address is not applied: the destination LAN IP preservation policy keeps the active management path reachable.'
+		fi
 		gcm_add_result "$dangerous" 'Network, firewall, and Wi-Fi files are staged last; service reload/reboot is deferred until after controller success.'
 	fi
 	if [ "$strategy" = clone ] || [ "$strategy" = remote-safe ] || [ "$strategy" = snapshot ]; then
@@ -1669,6 +1990,40 @@ gcm_validate() {
 	if [ "$strategy" = clone ] || [ "$strategy" = remote-safe ] || [ "$strategy" = snapshot ]; then
 		gcm_add_result "$will" 'A target-side pre-restore snapshot will be created before any file is changed.'
 	fi
+	# Destination LAN IP preservation plan reporting. The address is captured
+	# in the target execution context (this validation run) and reported under
+	# Will preserve when enabled, or as an explicit Will apply LAN-IP line
+	# when disabled. A missing or invalid target address blocks validation
+	# instead of silently falling back to the backup address.
+	if [ "$preserve_destination_lan_ip" = 1 ] && [ "$lan_restore_possible" = 1 ]; then
+		if gcm_capture_destination_lan_ip; then
+			if [ -n "$backup_lan_ip" ] && [ "$backup_lan_ip" != "$GCM_DESTINATION_LAN_IP" ]; then
+				gcm_add_result "$preserve" "Destination LAN IP $GCM_DESTINATION_LAN_IP will be preserved instead of backup LAN IP $backup_lan_ip."
+			else
+				gcm_add_result "$preserve" "Destination LAN IP $GCM_DESTINATION_LAN_IP will be preserved."
+			fi
+			if [ "$strategy" = portable ] && gcm_has_category "$categories" dhcp; then
+				plan_portable_file="$prefix_dir/portable/profile"
+				plan_netmask=$(gcm_uci_file_option "$plan_portable_file" lan '' netmask)
+				gcm_valid_ipv4 "$plan_netmask" || plan_netmask=255.255.255.0
+				conflict_reported=0
+				for reservation_ip in $(gcm_uci_file_type_ips "$plan_portable_file" reservation); do
+					gcm_valid_ipv4 "$reservation_ip" || continue
+					if ! gcm_ipv4_same_subnet "$reservation_ip" "$GCM_DESTINATION_LAN_IP" "$plan_netmask"; then
+						if [ "$conflict_reported" = 0 ]; then
+							conflict_reported=1
+							gcm_add_result "$warn" "Static DHCP reservation(s) from the backup reference $reservation_ip, which is outside the preserved destination subnet; dnsmasq may not serve them."
+						fi
+					fi
+				done
+			fi
+		else
+			compatible=false
+			gcm_add_result "$incompatible" 'Cannot preserve destination LAN IP because network.lan.ipaddr is not defined on the target. Disable preservation or set a LAN address first.'
+		fi
+	elif [ "$lan_restore_possible" = 1 ] && [ -n "$backup_lan_ip" ]; then
+		gcm_add_result "$will" "LAN IP: $backup_lan_ip will apply."
+	fi
 	printf '{"archive_kind":"%s","backup_strategy":"%s","compatible":%s,' "$kind" "$strategy" "$compatible"
 	printf '"source":{"model":"%s","id":"%s","firmware":"%s","openwrt":"%s","architecture":"%s","kernel":"%s"},' "$(gcm_json_escape "$source_model")" "$(gcm_json_escape "$source_id")" "$(gcm_json_escape "$source_firmware")" "$(gcm_json_escape "$source_openwrt")" "$(gcm_json_escape "$source_arch")" "$(gcm_json_escape "$source_kernel")"
 	printf '"target":{"model":"%s","id":"%s","firmware":"%s","openwrt":"%s","architecture":"%s","kernel":"%s"},' "$(gcm_json_escape "$target_model")" "$(gcm_json_escape "$target_id")" "$(gcm_json_escape "$target_firmware")" "$(gcm_json_escape "$target_openwrt")" "$(gcm_json_escape "$target_arch")" "$(gcm_json_escape "$target_kernel")"
@@ -1679,6 +2034,8 @@ gcm_validate() {
 	printf ',"will_skip":'; gcm_json_array_file "$skip"
 	printf ',"warnings":'; gcm_json_array_file "$warn"
 	printf ',"dangerous_actions":'; gcm_json_array_file "$dangerous"
+	printf ',"preserve_destination_lan_ip":%s' "$preserve_destination_lan_ip"
+	printf ',"destination_lan_ip":"%s"' "$(gcm_json_escape "${GCM_DESTINATION_LAN_IP:-}")"
 	printf '}\n'
 	incompatible_count=0
 	if [ "$compatible" = true ]; then
@@ -1781,7 +2138,16 @@ gcm_apply_portable_lan_dhcp_dns() {
 			# Only logical L3 values are portable. Device/ifname/type/bridge and
 			# switch topology are intentionally untouched.
 			gcm_set_if_value network lan proto "$proto"
-			gcm_set_if_value network lan ipaddr "$(gcm_profile_get "$config_dir" "$section" address)"
+			if [ "${GCM_PRESERVE_DESTINATION_LAN_IP:-0}" = 1 ]; then
+				# Connectivity-safety policy: the destination management address
+				# is immutable restore-state and was captured before this apply
+				# started. The backed-up address is never staged.
+				backup_portable_ip=$(gcm_profile_get "$config_dir" "$section" address)
+				gcm_diag INFO "action=${GCM_ACTION:-restore}" 'stage=preserve-lan-ip' "destination_lan_ip=${GCM_DESTINATION_LAN_IP:-unset}" "backup_lan_ip=${backup_portable_ip:-}" 'result=preserved' 'msg=Portable LAN address override skipped; destination address retained'
+				gcm_log 'PRESERVED=portable:network.lan.ipaddr:destination-ip-retained'
+			else
+				gcm_set_if_value network lan ipaddr "$(gcm_profile_get "$config_dir" "$section" address)"
+			fi
 			gcm_set_if_value network lan netmask "$(gcm_profile_get "$config_dir" "$section" netmask)"
 			gcm_set_if_value network lan gateway "$(gcm_profile_get "$config_dir" "$section" gateway)"
 			gcm_set_if_value network lan dns "$(gcm_profile_get "$config_dir" "$section" dns)"
@@ -2102,19 +2468,23 @@ gcm_apply_raw_uci() {
 	source_dir=$1
 	strategy=$2
 	categories=$3
+	# Sandbox overrides mirroring GCM_ROLLBACK_TARGET_ROOT so tests never touch
+	# the live tree; defaults preserve production behavior.
+	config_target_root="${GCM_CONFIG_TARGET_ROOT:-/}"
+	stage_pending_root="${GCM_STAGED_ROOT:-/root/glinet-crossmodel/pending-remote-safe}"
 	for source in "$source_dir"/*; do
 		[ -f "$source" ] || continue
 		package=${source##*/}
 		gcm_raw_package_selected "$package" "$categories" || { gcm_log "SKIPPED=uci:$package:not-selected"; continue; }
 		case "$package" in network|firewall|wireless) continue ;; esac
 		if [ "$strategy" = snapshot ]; then
-			cp -p "$source" "/etc/config/$package" || return 1
+			cp -p "$source" "${config_target_root%/}/etc/config/$package" || return 1
 			gcm_clear_uci_delta "$package"
 			gcm_diag DEBUG 'action=restore' 'stage=commit' "uci_package=$package" 'action_name=replace-snapshot' 'result=success'
 		else
 			identity=$(mktemp /tmp/gcm-raw-identity.XXXXXX) || return 1
 			gcm_target_identity_assignments "$package" "$identity"
-			cp -p "$source" "/etc/config/$package" || { rm -f "$identity"; return 1; }
+			cp -p "$source" "${config_target_root%/}/etc/config/$package" || { rm -f "$identity"; return 1; }
 			gcm_reapply_target_identity "$identity" || { rm -f "$identity"; return 1; }
 			gcm_clear_uci_delta "$package"
 			if uci commit "$package"; then
@@ -2128,27 +2498,48 @@ gcm_apply_raw_uci() {
 		source="$source_dir/$package"
 		[ -f "$source" ] || continue
 		gcm_raw_package_selected "$package" "$categories" || { gcm_log "SKIPPED=uci:$package:not-selected"; continue; }
+		# Connectivity-safety policy: when preservation is enabled, rewrite the
+		# backed-up network package to the captured destination LAN address
+		# BEFORE it is staged or copied into the live tree. The source backup
+		# address therefore never becomes the committed or staged destination
+		# address, even transiently.
+		preserve_source=''
+		if [ "$package" = network ] && [ "${GCM_PRESERVE_DESTINATION_LAN_IP:-0}" = 1 ]; then
+			preserve_source=$(mktemp /tmp/gcm-network-preserve.XXXXXX) || return 1
+			cp -p "$source" "$preserve_source" || { rm -f "$preserve_source"; return 1; }
+			if ! gcm_file_force_lan_ipaddr "$preserve_source" "$GCM_DESTINATION_LAN_IP"; then
+				rm -f "$preserve_source"
+				gcm_diag ERROR 'action=restore' 'stage=preserve-lan-ip' "destination_lan_ip=${GCM_DESTINATION_LAN_IP:-unset}" 'result=failed' 'reason=network-rewrite-failed'
+				return 1
+			fi
+			source="$preserve_source"
+			backup_raw_ip=$(gcm_file_lan_ipaddr "$source_dir/$package")
+			gcm_diag INFO 'action=restore' 'stage=preserve-lan-ip' "destination_lan_ip=${GCM_DESTINATION_LAN_IP:-unset}" "backup_lan_ip=${backup_raw_ip:-}" 'result=preserved' 'msg=Raw network package rewritten to the preserved destination address before staging'
+			gcm_log 'PRESERVED=network.lan.ipaddr:destination-ip-enforced-before-staging'
+		fi
 		if [ "$strategy" = remote-safe ] && [ -n "${SSH_CONNECTION:-}" ]; then
-			pending="/root/glinet-crossmodel/pending-remote-safe"
-			mkdir -p "$pending" || return 1
-			cp -p "$source" "$pending/$package" || return 1
-			gcm_log "PRESERVED=uci:$package:active-ssh-management-path;source-staged-$pending/$package"
-			gcm_diag INFO 'action=restore' 'stage=apply' "uci_package=$package" 'result=preserved' 'reason=active-ssh-management-path' "staged_path=$pending/$package"
+			mkdir -p "$stage_pending_root" || { [ -n "$preserve_source" ] && rm -f "$preserve_source"; return 1; }
+			cp -p "$source" "$stage_pending_root/$package" || { [ -n "$preserve_source" ] && rm -f "$preserve_source"; return 1; }
+			[ -n "$preserve_source" ] && rm -f "$preserve_source"
+			gcm_log "PRESERVED=uci:$package:active-ssh-management-path;source-staged-$stage_pending_root/$package"
+			gcm_diag INFO 'action=restore' 'stage=apply' "uci_package=$package" 'result=preserved' 'reason=active-ssh-management-path' "staged_path=$stage_pending_root/$package"
 			continue
 		fi
 		if [ "$strategy" = snapshot ]; then
-			cp -p "$source" "/etc/config/$package" || return 1
+			cp -p "$source" "${config_target_root%/}/etc/config/$package" || { [ -n "$preserve_source" ] && rm -f "$preserve_source"; return 1; }
+			[ -n "$preserve_source" ] && rm -f "$preserve_source"
 			gcm_clear_uci_delta "$package"
 		else
-			identity=$(mktemp /tmp/gcm-raw-identity.XXXXXX) || return 1
+			identity=$(mktemp /tmp/gcm-raw-identity.XXXXXX) || { [ -n "$preserve_source" ] && rm -f "$preserve_source"; return 1; }
 			gcm_target_identity_assignments "$package" "$identity"
-			cp -p "$source" "/etc/config/$package" || { rm -f "$identity"; return 1; }
-			gcm_reapply_target_identity "$identity" || { rm -f "$identity"; return 1; }
+			cp -p "$source" "${config_target_root%/}/etc/config/$package" || { rm -f "$identity"; [ -n "$preserve_source" ] && rm -f "$preserve_source"; return 1; }
+			gcm_reapply_target_identity "$identity" || { rm -f "$identity"; [ -n "$preserve_source" ] && rm -f "$preserve_source"; return 1; }
+			rm -f "$identity"
+			[ -n "$preserve_source" ] && rm -f "$preserve_source"
 			gcm_clear_uci_delta "$package"
 			if uci commit "$package"; then
 				gcm_diag DEBUG 'action=restore' 'stage=commit' "uci_package=$package" 'action_name=commit' 'result=success'
-			else status=$?; gcm_diag ERROR 'action=restore' 'stage=commit' "uci_package=$package" "exit_code=$status" 'result=failed'; rm -f "$identity"; return 1; fi
-			rm -f "$identity"
+			else status=$?; gcm_diag ERROR 'action=restore' 'stage=commit' "uci_package=$package" "exit_code=$status" 'result=failed'; return 1; fi
 		fi
 		gcm_log "APPLIED_LAST=uci:$package"
 	done
@@ -2157,13 +2548,47 @@ gcm_apply_raw_uci() {
 
 gcm_apply_extra_tree() {
 	tree=$1
+	# Persistent-extra members overlay root paths exactly (/etc/config/network
+	# -> extra/etc/config/network). Sandbox override mirrors GCM_CONFIG_TARGET_ROOT
+	# so tests never touch the live tree; defaults preserve production behavior.
+	extra_target_root="${GCM_EXTRA_TARGET_ROOT:-/}"
 	[ -d "$tree" ] || return 0
 	find "$tree" -type f | while IFS= read -r source; do
 		relative=${source#"$tree"/}
 		gcm_safe_member "$relative" || exit 1
-		destination="/$relative"
+		destination="$extra_target_root/$relative"
+		# Duplicate-network protection: when destination LAN IP preservation is
+		# armed, an extra-tree copy of the network package (e.g. left behind by
+		# persistent keep.d behavior) must not reintroduce the backed-up LAN
+		# address after raw-UCI apply already enforced the preserved address.
+		# The member still applies - it remains the final overlay in this
+		# restore path - but its primary lan ipaddr is rewritten to the
+		# captured destination address first, exactly like the raw UCI
+		# package. Without a captured address there is nothing to enforce, so
+		# the member is skipped rather than risking an unreachable management
+		# address; a structurally unrewritable member aborts into the normal
+		# rollback path, matching raw-UCI rewrite failure handling.
+		if [ "$relative" = etc/config/network ] && [ "${GCM_PRESERVE_DESTINATION_LAN_IP:-0}" = 1 ]; then
+			if [ -n "${GCM_DESTINATION_LAN_IP:-}" ] && gcm_valid_ipv4 "$GCM_DESTINATION_LAN_IP"; then
+				extra_temp=$(mktemp /tmp/gcm-extra-network.XXXXXX) || exit 1
+				cp -p "$source" "$extra_temp" || { rm -f "$extra_temp"; exit 1; }
+				if ! gcm_file_force_lan_ipaddr "$extra_temp" "$GCM_DESTINATION_LAN_IP"; then
+					rm -f "$extra_temp"
+					gcm_diag ERROR 'action=restore' 'stage=preserve-lan-ip' 'member=extra/etc/config/network' "destination_lan_ip=${GCM_DESTINATION_LAN_IP:-unset}" 'result=failed' 'reason=extra-network-rewrite-failed' 'msg=Persistent extra network package could not be rewritten to the preserved destination LAN IP'
+					exit 1
+				fi
+				source="$extra_temp"
+				gcm_log "PRESERVED=persistent:$destination:network.lan.ipaddr-rewritten-before-install"
+				gcm_diag INFO 'action=restore' 'stage=preserve-lan-ip' 'member=extra/etc/config/network' "destination_lan_ip=${GCM_DESTINATION_LAN_IP:-unset}" 'result=preserved' 'msg=Persistent extra network package rewritten to the preserved destination LAN IP before install'
+			else
+				gcm_log "SKIPPED=persistent:$destination:preserve-destination-lan-ip-no-captured-address"
+				gcm_diag INFO 'action=restore' 'stage=preserve-lan-ip' 'member=extra/etc/config/network' 'result=skipped' 'reason=no-captured-destination-ip' 'msg=Persistent extra network package skipped because no destination LAN IP was captured'
+				continue
+			fi
+		fi
 		mkdir -p "$(dirname "$destination")" || exit 1
-		cp -p "$source" "$destination" || exit 1
+		cp -p "$source" "$destination" || { [ -n "${extra_temp:-}" ] && rm -f "$extra_temp"; exit 1; }
+		[ -z "${extra_temp:-}" ] || { rm -f "$extra_temp"; extra_temp=''; }
 		gcm_log "APPLIED=persistent:$destination"
 	done
 }
@@ -2307,15 +2732,18 @@ gcm_restore() {
 	direct_custom=${4:-0}
 	dangerous_override=${5:-0}
 	allow_legacy=${6:-0}
+	preserve_destination_lan_ip=${7:-0}
+	case "$preserve_destination_lan_ip" in 1|true|yes) preserve_destination_lan_ip=1 ;; *) preserve_destination_lan_ip=0 ;; esac
 	[ "${GCM_ACTION:-}" = restore ] || gcm_prepare_operation restore
 	GCM_COMPONENT=restore
+	export GCM_PRESERVE_DESTINATION_LAN_IP=$preserve_destination_lan_ip
 	restore_started=$(date +%s 2>/dev/null || printf 0)
-	gcm_diag INFO 'action=restore' 'stage=request' "archive=$archive" "categories=$categories" "direct_custom_files=$direct_custom" "dangerous_override=$dangerous_override" "allow_legacy=$allow_legacy" "package_selection=$package_selection" 'msg=Restore requested'
+	gcm_diag INFO 'action=restore' 'stage=request' "archive=$archive" "categories=$categories" "direct_custom_files=$direct_custom" "dangerous_override=$dangerous_override" "allow_legacy=$allow_legacy" "preserve_destination_lan_ip=$preserve_destination_lan_ip" "package_selection=$package_selection" 'msg=Restore requested'
 	categories=$(gcm_valid_categories "$categories") || { gcm_die 'Invalid restore categories.'; return 1; }
 	[ -f "$archive" ] || { GCM_STAGE='archive-locate'; gcm_die 'Archive is missing.'; return 1; }
 	gcm_diag INFO 'action=restore' 'stage=archive-locate' "archive=$archive" "archive_size=$(gcm_file_size "$archive")" 'result=success' 'msg=Restore archive located'
 	gcm_diag INFO 'action=restore' 'stage=validation' 'msg=Mandatory restore validation started'
-	plan=$(gcm_validate "$archive" "$categories" "$dangerous_override") || return 1
+	plan=$(gcm_validate "$archive" "$categories" "$dangerous_override" "$preserve_destination_lan_ip") || return 1
 	GCM_ACTION=restore; GCM_COMPONENT=restore; export GCM_ACTION GCM_COMPONENT
 	if ! printf '%s' "$plan" | grep -q '"compatible":true'; then gcm_die 'Restore blocked by validation incompatibility.'; return 1; fi
 	kind=$(printf '%s' "$plan" | sed -n 's/.*"archive_kind":"\([^"]*\)".*/\1/p')
@@ -2341,6 +2769,33 @@ gcm_restore() {
 		source_architecture=$(gcm_manifest_field "$prefix_dir/meta.json" architecture)
 	fi
 	gcm_diag INFO 'action=restore' 'stage=metadata' "archive_type=$kind" "strategy=$strategy" "profile_uuid=$profile_id" "source_model=$source_model" "source_firmware=$source_firmware" "source_architecture=$source_architecture" "target_model=$(gcm_source_model)" "target_firmware=$(gcm_firmware_version)" "target_architecture=$(gcm_architecture)" 'msg=Restore metadata confirmed'
+	# Destination LAN IP preservation. The validation run captured the target
+	# address inside a subshell, so only the plan fields survive here. When the
+	# plan reports that preservation is active AND a destination address was
+	# captured (i.e. this restore can change the LAN address), capture again in
+	# this execution context before any mutation. The value is immutable
+	# restore-state; a drift from the validated address invalidates the plan.
+	GCM_DESTINATION_LAN_IP=''
+	plan_preserve=$(printf '%s' "$plan" | sed -n 's/.*"preserve_destination_lan_ip":\([01]\).*/\1/p')
+	plan_destination_ip=$(printf '%s' "$plan" | sed -n 's/.*"destination_lan_ip":"\([^"]*\)".*/\1/p')
+	case "$plan_preserve" in 1) plan_preserve=1 ;; *) plan_preserve=0 ;; esac
+	if [ "$plan_preserve" = 1 ] && [ -n "$plan_destination_ip" ]; then
+		if ! gcm_capture_destination_lan_ip; then
+			rm -rf "$work"
+			GCM_STAGE='preserve-lan-ip'
+			gcm_die 'Restore blocked: cannot preserve destination LAN IP because network.lan.ipaddr is not defined or is invalid on the target. Disable preservation or set a LAN address first.'
+			return 1
+		fi
+		if [ "$GCM_DESTINATION_LAN_IP" != "$plan_destination_ip" ]; then
+			gcm_diag ERROR 'action=restore' 'stage=preserve-lan-ip' "validated_lan_ip=$plan_destination_ip" "current_lan_ip=$GCM_DESTINATION_LAN_IP" 'result=blocked' 'reason=destination-lan-ip-changed-since-validation' 'msg=Destination LAN IP changed since validation; run validation again before restoring.'
+			rm -rf "$work"
+			GCM_STAGE='preserve-lan-ip'
+			gcm_die 'Destination LAN IP changed since validation. Run validation again before restoring.'
+			return 1
+		fi
+		gcm_diag INFO 'action=restore' 'stage=preserve-lan-ip' "destination_lan_ip=$GCM_DESTINATION_LAN_IP" 'result=enforcing' 'msg=Preserved destination LAN IP confirmed for this restore'
+	fi
+	export GCM_DESTINATION_LAN_IP
 	snapshot=$(gcm_pre_restore_snapshot "$profile_id" "$prefix_dir" "$direct_custom") || { rm -rf "$work"; gcm_die 'Could not create the mandatory pre-restore snapshot.'; return 1; }
 	gcm_log "PRE_RESTORE_SNAPSHOT=$snapshot/pre-restore.tar.gz"
 	gcm_diag INFO 'action=restore' 'stage=apply-start' "strategy=$strategy" "snapshot_path=$snapshot/pre-restore.tar.gz" 'msg=Beginning restore apply phase'
@@ -2412,6 +2867,14 @@ gcm_restore() {
 		gcm_category_log INFO packages start 'msg=Selected package installation phase started'
 		gcm_install_selected_packages "$prefix_dir/source/packages.tsv" "$package_selection"
 		gcm_category_log INFO packages complete 'result=success-with-noncritical-skips-possible'
+	fi
+	# Connectivity-safety verification: when preservation is enabled the
+	# committed (or, for remote-safe over SSH, staged) network configuration
+	# must still carry the destination LAN IP captured before the snapshot.
+	# A mismatch aborts into the normal rollback path; the rollback baseline
+	# itself is never modified by the preservation policy.
+	if [ "$apply_ok" -eq 1 ] && [ "$preserve_destination_lan_ip" = 1 ]; then
+		if ! gcm_verify_destination_lan_ip "$strategy"; then apply_ok=0; fi
 	fi
 	if [ "$apply_ok" -ne 1 ]; then
 		gcm_log 'RESTORE=failed;attempting-rollback'
