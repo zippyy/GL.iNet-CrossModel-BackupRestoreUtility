@@ -115,7 +115,11 @@ async function resolveConnection(body) {
       acceptNewHostKey: false
     };
   }
-  const c = body.connection || {};
+  // Ad-hoc connection: accept the documented nested shape (body.connection) OR
+  // the UI's flat shape (host/port/... at top level, as /api/routers/test and
+  // the router form send). Both must behave identically.
+  const hasNested = body.connection && typeof body.connection === 'object' && !Array.isArray(body.connection);
+  const c = hasNested ? body.connection : body;
   return {
     host: c.host,
     port: c.port ?? 22,
@@ -783,3 +787,7 @@ for (const signal of ['SIGTERM', 'SIGINT']) {
     setTimeout(() => process.exit(0), 5000).unref();
   });
 }
+
+// Export the running server/app so integration tests can import the real
+// controller on an ephemeral port (PORT=0) and close it deterministically.
+export { app, server, dataDir, logger };

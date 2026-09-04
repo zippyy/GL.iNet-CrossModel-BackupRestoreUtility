@@ -164,6 +164,11 @@ function runShell(command, inputStream) {
   });
 }
 
+// Exported so test execHooks can delegate to the same host shell runner after
+// injecting sandbox environment (the pipeline test drives the canonical
+// runtime over SSH with GCM_* sandbox roots, mirroring the native harness).
+export { runShell };
+
 // ssh2 sftp OPEN_MODE flags (ssh2-streams).
 const OPEN_MODE = { READ: 0x00000001, WRITE: 0x00000002, CREAT: 0x00000008, TRUNC: 0x00000010 };
 
@@ -172,11 +177,14 @@ function attachSftpHandler(sftp, root) {
   let nextHandle = 1;
   const resolvePath = (filename) => {
     // The client sends router-absolute paths (/tmp/...). The fixture serves a
-    // chroot-like view: map them under the sftp root.
+    // chroot-like view: map them under the sftp root. A root of "/" makes the
+    // fixture a genuine host-backed router: SFTP and exec commands then see
+    // the same real files (used by pipeline tests whose canonical runtime
+    // streams archives over SFTP and verifies them with sha256sum over exec).
     const relative = String(filename).replace(/^\/+/, '');
     const full = path.join(root, relative);
     const base = path.resolve(root);
-    if (full !== base && !full.startsWith(base + path.sep)) throw new Error('path escape');
+    if (full !== base && !full.startsWith(base.endsWith(path.sep) ? base : base + path.sep)) throw new Error('path escape');
     return full;
   };
 
