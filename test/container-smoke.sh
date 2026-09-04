@@ -44,6 +44,16 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# On any set -e exit, dump container state and logs so CI failures are never
+# silent (the earlier run died at a docker exec with stderr swallowed).
+dump_diagnostics() {
+  echo "--- container diagnostics ---" >&2
+  docker ps -a --filter "name=$NAME" --format '{{.Names}}  {{.Status}}' >&2 2>/dev/null || true
+  docker inspect -f 'state={{.State.Status}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} exit={{.State.ExitCode}} error={{.State.Error}}' "$NAME" >&2 2>/dev/null || true
+  docker logs --tail 40 "$NAME" >&2 2>/dev/null || true
+}
+trap 'dump_diagnostics' ERR
+
 echo "== compose config =="
 export GCM_ADMIN_PASSWORD_FILE="$SECRET_FILE"
 if docker compose config >/dev/null 2>&1; then ok 'docker compose config is valid'; else die 'docker compose config FAILED'; fi
@@ -77,11 +87,16 @@ done
 [ "$HEALTHY" = 1 ] || die 'container never became healthy'
 ok 'container health endpoint is healthy'
 
+echo "== container running state =="
+STATUS=$(docker ps --filter "name=$NAME" --format '{{.Status}}')
+echo "container status: $STATUS"
+case "$STATUS" in Up*) ok 'container is running' ;; *) die "container is not running: $STATUS" ;; esac
+
 echo "== non-root + filesystem layout =="
-UID_OUT=$(docker exec "$NAME" id -u 2>/dev/null | tr -d ' ')
+UID_OUT=$(docker exec "$NAME" id -u | tr -d ' ')
 if [ -n "$UID_OUT" ] && [ "$UID_OUT" != 0 ]; then ok "process uid is $UID_OUT (not root)"; else die "process uid is '$UID_OUT' (expected non-zero)"; fi
-if docker exec "$NAME" sh -c 'test -w /data && touch /data/.smoke-write && rm /data/.smoke-write' 2>/dev/null; then ok '/data is writable by the runtime user'; else die '/data is NOT writable'; fi
-if docker exec "$NAME" sh -c '! touch /app/server.js' 2>/dev/null; then ok 'application tree is read-only to the runtime user'; else bad 'application tree is writable'; fi
+if docker exec "$NAME" sh -c 'test -w /data && touch /data/.smoke-write && rm /data/.smoke-write'; then ok '/data is writable by the runtime user'; else die '/data is NOT writable'; fi
+if docker exec "$NAME" sh -c '! touch /app/server.js 2>/dev/null'; then ok 'application tree is read-only to the runtime user'; else bad 'application tree is writable'; fi
 
 echo "== auth fail-closed =="
 # Unauthenticated API request -> 401
