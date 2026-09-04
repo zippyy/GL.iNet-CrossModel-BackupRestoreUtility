@@ -1,11 +1,18 @@
 {
-  "name": "glinet-crossmodel-backup-restore",
-  "version": "1.0.0",
+  "name": "glinet-crossmodel-backuprestoreutility",
+  "version": "2.0.0-docker.1",
   "type": "module",
-  "description": "Portable GL.iNet cross-model backup and restore utility.",
-  "scripts": { "start": "node server.js" },
+  "description": "Self-hosted Docker/controller edition of GL.iNet Cross-Model Backup, Migration and Recovery. Streams the canonical native router runtime over SSH; no package is installed on managed routers.",
+  "license": "MIT",
   "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/",
+    "lint": "node scripts/lint.js",
+    "sync-runtime": "sh scripts/sync-native-runtime.sh"
+  },
   "dependencies": {
+    "cookie-parser": "^1.4.7",
     "express": "^5.1.0",
     "express-rate-limit": "^8.0.1",
     "helmet": "^8.1.0",
