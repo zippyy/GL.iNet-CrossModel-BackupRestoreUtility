@@ -1,4 +1,6 @@
 node_modules/
-data/backups/*.json
+data/
 .env
 .DS_Store
+*.log
+tmp/
