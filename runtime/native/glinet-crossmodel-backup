@@ -1,0 +1,3 @@
+#!/bin/sh
+# Compatibility entry point retained for existing integrations.
+exec /usr/bin/glinet-crossmodel "$@"
