@@ -46,7 +46,11 @@ trap 'dump_diagnostics' ERR
 WORK=$(mktemp -d /tmp/gcm-container-smoke.XXXXXX)
 SECRET_FILE="${SMOKE_SECRET_FILE:-$WORK/admin_password}"
 [ -f "$SECRET_FILE" ] || printf '%s\n' 'container-smoke-admin-secret-123' > "$SECRET_FILE"
-chmod 600 "$SECRET_FILE"
+# The bind-mounted secret must be readable by the container's non-root user
+# (uid 1000). Linux honors the host file mode inside the container, so a
+# root-owned 600 file yields EACCES and the server (correctly) fails closed.
+# This is a throwaway test secret inside a 700 temp dir / CI workspace.
+chmod 644 "$SECRET_FILE"
 ADMIN_PASSWORD=$(cat "$SECRET_FILE")
 NAME="gcm-smoke-$RANDOM$$"
 PORT=$((20000 + RANDOM % 20000))
@@ -72,6 +76,25 @@ else
   ok 'docker build succeeded'
 fi
 
+echo "== fail-closed: no admin credential =="
+NOCRED_NAME="gcm-smoke-nocred-$RANDOM$$"
+if docker run -d --name "$NOCRED_NAME" -v "$VOLUME:/data" -p "127.0.0.1:$PORT:8787" "$IMAGE" >/dev/null 2>&1; then
+  sleep 3
+  NC_STATE=$(docker inspect -f '{{.State.Status}} exit={{.State.ExitCode}}' "$NOCRED_NAME" 2>/dev/null || echo missing)
+  NC_LOG=$(docker logs "$NOCRED_NAME" 2>&1 || true)
+  docker rm -f "$NOCRED_NAME" >/dev/null 2>&1 || true
+  case "$NC_STATE" in running*) bad "no-credential container is running (must fail closed): $NC_STATE" ;; *)
+    ok "container without admin credential fails closed ($NC_STATE)" ;;
+  esac
+  if printf '%s' "$NC_LOG" | grep -q 'No admin credential'; then
+    ok 'fail-closed error names the missing admin credential'
+  else
+    bad 'no-credential container did not log the auth error'
+  fi
+else
+  bad 'no-credential container failed to start for an unexpected reason'
+fi
+
 echo "== start container (read-only root, tmpfs /tmp, named volume /data, secret file) =="
 docker run -d --name "$NAME" \
   --read-only \
@@ -85,9 +108,13 @@ docker run -d --name "$NAME" \
 CLEANUP+=("$NAME")
 
 echo "== wait for health =="
+# Require BOTH running state AND a real healthy healthcheck. Docker seeds the
+# health status to "healthy" before the monitor evaluates it, so a container
+# that crashes instantly can otherwise false-positive the health gate.
 HEALTHY=0
-for _ in $(seq 1 60); do
-  if docker inspect -f '{{.State.Health.Status}}' "$NAME" 2>/dev/null | grep -q healthy; then HEALTHY=1; break; fi
+for _ in $(seq 1 90); do
+  STATE=$(docker inspect -f '{{.State.Status}}' "$NAME" 2>/dev/null || echo missing)
+  if [ "$STATE" = running ] && docker inspect -f '{{.State.Health.Status}}' "$NAME" 2>/dev/null | grep -q healthy; then HEALTHY=1; break; fi
   sleep 1
 done
 [ "$HEALTHY" = 1 ] || die 'container never became healthy'
