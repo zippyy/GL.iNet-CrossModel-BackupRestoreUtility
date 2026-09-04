@@ -7,7 +7,7 @@
   "engines": { "node": ">=20" },
   "scripts": {
     "start": "node server.js",
-    "test": "sh test/run-native.sh && node --test --test-timeout=60000 test/",
+    "test": "sh test/run-native.sh && node --test --test-timeout=60000 test/*.test.js",
     "lint": "node scripts/lint.js",
     "sync-runtime": "sh scripts/sync-native-runtime.sh"
   },
