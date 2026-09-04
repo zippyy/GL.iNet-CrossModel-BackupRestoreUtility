@@ -1,0 +1,17 @@
+# Development/build context exclusions for the production image.
+.git
+.github
+.gitignore
+node_modules
+data
+tmp
+coverage
+*.log
+.env
+.env.*
+secrets
+test
+tests
+docs
+notes.txt
+.DS_Store

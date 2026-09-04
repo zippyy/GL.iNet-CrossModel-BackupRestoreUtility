@@ -1,9 +1,47 @@
+# GL.iNet Cross-Model Backup — Docker/controller edition.
+#
+# No administrator password is embedded here. The server refuses to start
+# without a credential. Provide one through a Docker secret file:
+#
+#   mkdir -p secrets
+#   printf '%s\n' 'change-me-to-a-long-random-password' > secrets/admin_password
+#   chmod 600 secrets/admin_password
+#   docker compose up -d
+#
+# (or point GCM_ADMIN_PASSWORD_FILE at any path you control). The secret is
+# mounted at /run/secrets/admin_password and read once at startup.
+
 services:
   glinet-crossmodel-backup:
+    image: ghcr.io/zippyy/glinet-crossmodel-backuprestoreutility:docker-latest
     build: .
     container_name: glinet-crossmodel-backup
     restart: unless-stopped
     ports:
       - "127.0.0.1:8787:8787"
+    environment:
+      DATA_DIR: /data
+      GCM_ADMIN_PASSWORD_FILE: /run/secrets/admin_password
+      GCM_LOG_LEVEL: INFO
     volumes:
-      - ./data:/app/data
+      - gcm-data:/data
+    tmpfs:
+      - /tmp
+    read_only: true
+    secrets:
+      - admin_password
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8787/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    init: true
+
+secrets:
+  admin_password:
+    file: ${GCM_ADMIN_PASSWORD_FILE:-./secrets/admin_password}
+
+volumes:
+  gcm-data:
+    name: glinet-crossmodel-data
