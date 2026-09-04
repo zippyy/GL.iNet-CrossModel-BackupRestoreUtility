@@ -33,7 +33,12 @@ dump_diagnostics() {
   echo "--- container diagnostics ---" >&2
   docker ps -a --filter "name=$NAME" --format '{{.Names}}  {{.Status}}' >&2 2>/dev/null || true
   docker inspect -f 'state={{.State.Status}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} exit={{.State.ExitCode}} error={{.State.Error}} oom={{.State.OOMKilled}}' "$NAME" >&2 2>/dev/null || echo "no container $NAME" >&2
-  docker logs --tail 50 "$NAME" >&2 2>/dev/null || true
+  echo "--- full container logs (verbatim) ---" >&2
+  docker logs "$NAME" >&2 2>&1 || echo "(docker logs failed)" >&2
+  echo "--- healthcheck log ---" >&2
+  docker inspect -f '{{range .State.Health.Log}}{{.ExitCode}} {{.Output}}{{end}}' "$NAME" >&2 2>/dev/null || true
+  echo "--- config summary ---" >&2
+  docker inspect -f 'user={{.Config.User}} readonly={{.HostConfig.ReadonlyRootfs}} entrypoint={{json .Config.Entrypoint}} cmd={{json .Config.Cmd}}' "$NAME" >&2 2>/dev/null || true
 }
 die() { dump_diagnostics; bad "$1"; exit 1; }
 trap 'dump_diagnostics' ERR
@@ -95,6 +100,25 @@ echo "== container running state =="
 RUNNING_STATE=$(docker inspect -f '{{.State.Status}}' "$NAME" 2>/dev/null || echo missing)
 echo "container state: $RUNNING_STATE"
 case "$RUNNING_STATE" in running) ok 'container is running' ;; *) die "container is not running: $RUNNING_STATE" ;; esac
+
+# If the hardened (read-only) container ever dies on its own, bisect with a
+# plain container (no --read-only, no tmpfs) so CI tells us whether the
+# read-only root is the trigger rather than guessing.
+if [ "$RUNNING_STATE" != running ]; then
+  echo "== bisect: same image without --read-only/tmpfs =="
+  PROBE_NAME="gcm-smoke-probe-$RANDOM$$"
+  docker run -d --name "$PROBE_NAME" \
+    -v "$VOLUME:/data" \
+    -v "$SECRET_FILE:/run/secrets/admin_password:ro" \
+    -e GCM_ADMIN_PASSWORD_FILE=/run/secrets/admin_password \
+    "$IMAGE" >/dev/null 2>&1 || echo "(probe container failed to start)"
+  sleep 4
+  PROBE_STATE=$(docker inspect -f '{{.State.Status}} exit={{.State.ExitCode}}' "$PROBE_NAME" 2>/dev/null || echo missing)
+  echo "probe state: $PROBE_STATE"
+  echo "--- probe logs ---"
+  docker logs "$PROBE_NAME" 2>&1 || true
+  docker rm -f "$PROBE_NAME" >/dev/null 2>&1 || true
+fi
 
 echo "== non-root + filesystem layout =="
 UID_OUT=$(docker exec "$NAME" id -u | tr -d ' ')
