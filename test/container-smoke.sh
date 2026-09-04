@@ -25,7 +25,18 @@ PASS=0
 FAIL=0
 ok()  { PASS=$((PASS + 1)); printf 'ok   %s\n' "$1"; }
 bad() { FAIL=$((FAIL + 1)); printf 'FAIL %s\n' "$1"; }
-die() { bad "$1"; exit 1; }
+
+# Every failure path dumps container state/logs so CI failures are never
+# silent (a previous run died at a docker exec with stderr swallowed and the
+# ERR trap did not fire on die's explicit exit).
+dump_diagnostics() {
+  echo "--- container diagnostics ---" >&2
+  docker ps -a --filter "name=$NAME" --format '{{.Names}}  {{.Status}}' >&2 2>/dev/null || true
+  docker inspect -f 'state={{.State.Status}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} exit={{.State.ExitCode}} error={{.State.Error}} oom={{.State.OOMKilled}}' "$NAME" >&2 2>/dev/null || echo "no container $NAME" >&2
+  docker logs --tail 50 "$NAME" >&2 2>/dev/null || true
+}
+die() { dump_diagnostics; bad "$1"; exit 1; }
+trap 'dump_diagnostics' ERR
 
 WORK=$(mktemp -d /tmp/gcm-container-smoke.XXXXXX)
 SECRET_FILE="${SMOKE_SECRET_FILE:-$WORK/admin_password}"
@@ -43,16 +54,6 @@ cleanup() {
   rm -rf "$WORK"
 }
 trap cleanup EXIT
-
-# On any set -e exit, dump container state and logs so CI failures are never
-# silent (the earlier run died at a docker exec with stderr swallowed).
-dump_diagnostics() {
-  echo "--- container diagnostics ---" >&2
-  docker ps -a --filter "name=$NAME" --format '{{.Names}}  {{.Status}}' >&2 2>/dev/null || true
-  docker inspect -f 'state={{.State.Status}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} exit={{.State.ExitCode}} error={{.State.Error}}' "$NAME" >&2 2>/dev/null || true
-  docker logs --tail 40 "$NAME" >&2 2>/dev/null || true
-}
-trap 'dump_diagnostics' ERR
 
 echo "== compose config =="
 export GCM_ADMIN_PASSWORD_FILE="$SECRET_FILE"
@@ -88,9 +89,12 @@ done
 ok 'container health endpoint is healthy'
 
 echo "== container running state =="
-STATUS=$(docker ps --filter "name=$NAME" --format '{{.Status}}')
-echo "container status: $STATUS"
-case "$STATUS" in Up*) ok 'container is running' ;; *) die "container is not running: $STATUS" ;; esac
+# Use docker inspect (proven to work on the CI runner) rather than docker ps,
+# which disagreed with the daemon in an earlier run. dump_diagnostics on the
+# die path below prints the full state + logs for any non-running container.
+RUNNING_STATE=$(docker inspect -f '{{.State.Status}}' "$NAME" 2>/dev/null || echo missing)
+echo "container state: $RUNNING_STATE"
+case "$RUNNING_STATE" in running) ok 'container is running' ;; *) die "container is not running: $RUNNING_STATE" ;; esac
 
 echo "== non-root + filesystem layout =="
 UID_OUT=$(docker exec "$NAME" id -u | tr -d ' ')
