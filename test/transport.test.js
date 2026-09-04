@@ -14,7 +14,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 
 import { generateKeys, startFakeRouter } from './fake-router.js';
-import { connectRouter, hostKeyId, execCommand } from '../lib/ssh.js';
+import { connectRouter, hostKeyId, execCommand, withRouter } from '../lib/ssh.js';
 import { remoteFacts, upstreamPin } from '../lib/engine.js';
 import { Logger } from '../lib/log.js';
 
@@ -177,4 +177,88 @@ test('SFTP round trip uploads and downloads byte-identical content', { timeout: 
 test('runtime pin file exists and is a full SHA-1', async () => {
   const pin = await upstreamPin();
   assert.match(pin, /^[0-9a-f]{40}$/);
+});
+
+// ---- Blocker 2 regression: trust policy must survive withRouter ----
+// The wrapper normalizes the connection and then forwards it to connectRouter,
+// which normalizes AGAIN. trustHostKey used to be dropped by the second
+// normalization, so accept-new connected but the fingerprint was never
+// persisted. These tests exercise the public wrapper path only.
+test('withRouter accept-new persists the fingerprint (regression: trust dropped by double normalization)', { timeout: 25000 }, async () => {
+  // A fresh host:port whose key is not yet trusted.
+  const router = await startFakeRouter({ password: 'router-secret-pw', hostKey: hostKeys.a, clientKeyRaw: clientKey.publicKeyRaw });
+  const key = hostKeyId(router.host, router.port);
+  assert.equal(trustStore.has(key), false, 'precondition: host key not yet trusted');
+  let taskRan = false;
+  try {
+    const connection = {
+      host: router.host, port: router.port, username: 'root',
+      authType: 'password', password: 'router-secret-pw',
+      acceptNewHostKey: true
+    };
+    // trustHostKey and hostKeyProvider arrive ONLY via the options argument,
+    // exactly like server.js passes them. The old code dropped the trust
+    // callback before the handshake, so the fingerprint was never stored.
+    await withRouter(connection, async () => { taskRan = true; }, { hostKeyProvider, trustHostKey, logger: mockLogger });
+    assert.equal(taskRan, true, 'task must run inside withRouter');
+    assert.ok(trustStore.has(key), 'accept-new through withRouter must persist the fingerprint');
+    assert.ok(trustStore.get(key).fingerprint, 'persisted record must carry the fingerprint');
+  } finally {
+    await router.close().catch(() => {});
+  }
+});
+
+test('withRouter same-key reconnect succeeds without accept-new', { timeout: 25000 }, async () => {
+  // Reuse the previous router's identity on a NEW port so the key id is
+  // trusted from the test above only if persistence worked; reconnect with
+  // acceptNewHostKey absent must verify against the stored fingerprint.
+  const router = await startFakeRouter({ password: 'router-secret-pw', hostKey: hostKeys.a, clientKeyRaw: clientKey.publicKeyRaw });
+  const key = hostKeyId(router.host, router.port);
+  // Trust it first through the wrapper (accept-new), as the prior test does.
+  if (!trustStore.has(key)) {
+    await withRouter({ host: router.host, port: router.port, username: 'root', authType: 'password', password: 'router-secret-pw', acceptNewHostKey: true }, async () => {}, { hostKeyProvider, trustHostKey, logger: mockLogger });
+  }
+  try {
+    await withRouter(
+      { host: router.host, port: router.port, username: 'root', authType: 'password', password: 'router-secret-pw' },
+      async ({ client }) => { await execCommand(client, 'true', { allowFailure: true }); },
+      { hostKeyProvider, trustHostKey, logger: mockLogger }
+    );
+    assert.ok(true, 'same-key reconnect through withRouter succeeds');
+  } finally {
+    await router.close().catch(() => {});
+  }
+});
+
+test('withRouter changed key is a HARD failure and never replaces the stored fingerprint', { timeout: 25000 }, async () => {
+  const router = await startFakeRouter({ password: 'router-secret-pw', hostKey: hostKeys.a, clientKeyRaw: clientKey.publicKeyRaw });
+  const key = hostKeyId(router.host, router.port);
+  const port = router.port;
+  if (!trustStore.has(key)) {
+    await withRouter({ host: router.host, port, username: 'root', authType: 'password', password: 'router-secret-pw', acceptNewHostKey: true }, async () => {}, { hostKeyProvider, trustHostKey, logger: mockLogger });
+  }
+  const oldFingerprint = trustStore.get(key).fingerprint;
+  try {
+    // Swap the router on the SAME port for different host keys (B).
+    await router.close().catch(() => {});
+    const impostor = await startFakeRouter({ password: 'router-secret-pw', hostKey: hostKeys.b, clientKeyRaw: clientKey.publicKeyRaw, port });
+    try {
+      await assert.rejects(
+        withRouter(
+          { host: impostor.host, port, username: 'root', authType: 'password', password: 'router-secret-pw' },
+          async () => {},
+          { hostKeyProvider, trustHostKey, logger: mockLogger }
+        ),
+        (err) => err.code === 'host-key-mismatch',
+        'changed host key through withRouter must hard-fail'
+      );
+    } finally {
+      await impostor.close().catch(() => {});
+    }
+    assert.equal(trustStore.get(key).fingerprint, oldFingerprint, 'stored fingerprint must never be replaced silently');
+  } finally {
+    // Restore the legitimate router so later tests are not poisoned.
+    const restored = await startFakeRouter({ password: 'router-secret-pw', hostKey: hostKeys.a, clientKeyRaw: clientKey.publicKeyRaw, port });
+    await restored.close().catch(() => {});
+  }
 });
