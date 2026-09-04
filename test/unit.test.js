@@ -75,6 +75,19 @@ test('auth: scrypt hash round trip and fail-closed startup', () => {
   assert.equal(cfg.verify('wrong'), false);
 });
 
+test('auth: GCM_ADMIN_PASSWORD_FILE (Docker secret) is read at startup and trims a trailing newline', () => {
+  const secretFile = path.join(work, 'admin-password');
+  fs.writeFileSync(secretFile, 'file-based-secret-123\n');
+  const cfg = authConfigFromEnv({ GCM_ADMIN_PASSWORD_FILE: secretFile });
+  assert.equal(cfg.verify('file-based-secret-123'), true);
+  assert.equal(cfg.verify('file-based-secret-123\n'), false);
+  assert.equal(cfg.verify('wrong'), false);
+  // Missing file and short secret fail closed.
+  assert.throws(() => authConfigFromEnv({ GCM_ADMIN_PASSWORD_FILE: path.join(work, 'does-not-exist') }), /Could not read/);
+  fs.writeFileSync(secretFile, 'short');
+  assert.throws(() => authConfigFromEnv({ GCM_ADMIN_PASSWORD_FILE: secretFile }), /at least 8/);
+});
+
 test('auth: sessions create/load/destroy with expiry', async () => {
   const store = new Store(path.join(work, 'auth-store'));
   await store.init();
